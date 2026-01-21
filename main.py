@@ -8,31 +8,33 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 
 app = Flask(__name__)
-# Use Environment Variable for secret key
 app.secret_key = os.environ.get('FLASK_SECRET_KEY', 'wealthwise-email-dev-key')
 
-# Force HTTPS for OAuth
-os.environ['OAUTHLIB_RELAX_TOKEN_SCOPE'] = '1'
+# Force HTTPS for OAuth in production
 if os.environ.get('VERCEL_URL'):
-    os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = '0' # Require HTTPS in production
+    os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = '0'
 else:
-    os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = '1' # Allow HTTP for local dev
+    os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = '1'
 
-# Configuration
 SCOPES = ['https://www.googleapis.com/auth/gmail.readonly', 'https://www.googleapis.com/auth/userinfo.profile', 'openid']
 
 def get_google_config():
-    """Returns the Google Client Config from Env Var or Local File"""
+    """Returns and unwraps the Google Client Config"""
     env_config = os.environ.get('GOOGLE_CLIENT_CONFIG')
-    if env_config:
-        return json.loads(env_config)
+    config = None
     
-    # Fallback to local file
-    client_secrets_file = "client_secret_555314315936-rr3b7ufe3e3l5dgd62vvsrcqe662lkpo.apps.googleusercontent.com.json"
-    if os.path.exists(client_secrets_file):
-        with open(client_secrets_file, 'r') as f:
-            return json.load(f)
-    return None
+    if env_config:
+        config = json.loads(env_config)
+    else:
+        # Fallback to local file
+        client_secrets_file = "client_secret_555314315936-rr3b7ufe3e3l5dgd62vvsrcqe662lkpo.apps.googleusercontent.com.json"
+        if os.path.exists(client_secrets_file):
+            with open(client_secrets_file, 'r') as f:
+                config = json.load(f)
+    
+    if config and 'web' in config:
+        return config['web'] # Unwrap the "web" key
+    return config
 
 def get_flow(state=None):
     config = get_google_config()
@@ -41,10 +43,10 @@ def get_flow(state=None):
     
     flow = Flow.from_client_config(config, scopes=SCOPES, state=state)
     
-    # Explicitly build the redirect URI to match Google Console exactly
+    # FORCE EXACT REDIRECT URI from your Google Console Screenshot
     if os.environ.get('VERCEL_URL'):
-        # We use the request host to support both the project URL and deployment URLs
-        flow.redirect_uri = f"https://{request.host}/authorized"
+        # We use the official domain to ensure it matches the Google whitelist perfectly
+        flow.redirect_uri = "https://email-ai-smart-categorizer.vercel.app/authorized"
     else:
         flow.redirect_uri = url_for('authorize', _external=True)
     
@@ -67,7 +69,6 @@ def login():
 def authorize():
     flow = get_flow(state=session.get('state'))
     
-    # Ensure the callback URL is treated as HTTPS
     authorization_response = request.url
     if 'http://' in authorization_response and os.environ.get('VERCEL_URL'):
         authorization_response = authorization_response.replace('http://', 'https://')
