@@ -8,13 +8,41 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 
 app = Flask(__name__)
-app.secret_key = 'wealthwise-email-secret-key' # In production, use a random secret
+# Use Environment Variable for secret key in production
+app.secret_key = os.environ.get('FLASK_SECRET_KEY', 'wealthwise-email-dev-key')
 
 # Configuration
-# Note: Using the specific filename found in your directory
-CLIENT_SECRETS_FILE = "client_secret_555314315936-rr3b7ufe3e3l5dgd62vvsrcqe662lkpo.apps.googleusercontent.com.json"
-SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
-os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = '1' # For local development only
+SCOPES = ['https://www.googleapis.com/auth/gmail.readonly', 'https://www.googleapis.com/auth/userinfo.profile', 'openid']
+
+def get_google_config():
+    """Returns the Google Client Config from Env Var or Local File"""
+    env_config = os.environ.get('GOOGLE_CLIENT_CONFIG')
+    if env_config:
+        return json.loads(env_config)
+    
+    # Fallback to local file
+    client_secrets_file = "client_secret_555314315936-rr3b7ufe3e3l5dgd62vvsrcqe662lkpo.apps.googleusercontent.com.json"
+    if os.path.exists(client_secrets_file):
+        with open(client_secrets_file, 'r') as f:
+            return json.load(f)
+    return None
+
+def get_flow(state=None):
+    config = get_google_config()
+    if not config:
+        raise Exception("Google Client Configuration missing! Add GOOGLE_CLIENT_CONFIG to Vercel Env Vars.")
+    
+    flow = Flow.from_client_config(config, scopes=SCOPES, state=state)
+    
+    # In production (Vercel), we must use HTTPS
+    # We can detect if we are on Vercel by checking for VERCEL_URL
+    if os.environ.get('VERCEL_URL'):
+        flow.redirect_uri = f"https://{os.environ.get('VERCEL_URL')}/authorize"
+    else:
+        # Standard local redirect
+        flow.redirect_uri = url_for('authorize', _external=True)
+    
+    return flow
 
 def get_gmail_service():
     if 'credentials' not in session:
@@ -38,9 +66,6 @@ def credentials_to_dict(credentials):
     }
 
 def categorize_email(headers, snippet):
-    """
-    Smart categorization logic based on headers and context
-    """
     subject = ""
     sender = ""
     list_unsubscribe = False
@@ -50,27 +75,16 @@ def categorize_email(headers, snippet):
         if h['name'] == 'From': sender = h['value'].lower()
         if h['name'] == 'List-Unsubscribe': list_unsubscribe = True
 
-    # Logic:
-    # 1. Social
     if any(x in sender for x in ['facebook', 'twitter', 'linkedin', 'instagram', 'youtube']):
         return "Social"
-    
-    # 2. Finance / Bills
     if any(x in subject for x in ['invoice', 'bill', 'receipt', 'payment', 'order', 'statement', 'transaction']):
         return "Finance & Bills"
-    
-    # 3. Promotions / Newsletters
     if list_unsubscribe or any(x in sender for x in ['newsletter', 'marketing', 'info@', 'no-reply@']):
         return "Promotions"
-    
-    # 4. Updates / Notifications
     if any(x in subject for x in ['update', 'security', 'alert', 'verify', 'confirm']):
         return "Updates"
-
-    # 5. Travel
     if any(x in subject for x in ['flight', 'hotel', 'booking', 'reservation', 'ticket']):
         return "Travel"
-
     return "Primary"
 
 @app.route('/')
@@ -81,24 +95,25 @@ def index():
 
 @app.route('/login')
 def login():
-    flow = Flow.from_client_secrets_file(CLIENT_SECRETS_FILE, scopes=SCOPES)
-    flow.redirect_uri = url_for('authorize', _external=True)
+    flow = get_flow()
     authorization_url, state = flow.authorization_url(access_type='offline', include_granted_scopes='true')
     session['state'] = state
     return redirect(authorization_url)
 
 @app.route('/authorize')
 def authorize():
-    flow = Flow.from_client_secrets_file(CLIENT_SECRETS_FILE, scopes=session['state'])
-    flow.redirect_uri = url_for('authorize', _external=True)
+    flow = get_flow(state=session.get('state'))
     
     authorization_response = request.url
+    # Workaround for Vercel/Proxy redirect issues with HTTP/HTTPS
+    if 'https' not in authorization_response and os.environ.get('VERCEL_URL'):
+        authorization_response = authorization_response.replace('http', 'https')
+        
     flow.fetch_token(authorization_response=authorization_response)
     
     credentials = flow.credentials
     session['credentials'] = credentials_to_dict(credentials)
     
-    # Get user info for UI
     user_info = build('oauth2', 'v2', credentials=credentials).userinfo().get().execute()
     session['user_info'] = user_info
     
@@ -116,17 +131,12 @@ def get_emails():
         return jsonify({"error": "Unauthorized"}), 401
 
     try:
-        # Fetch last 50 messages for speed
         results = service.users().messages().list(userId='me', maxResults=50).execute()
         messages = results.get('messages', [])
         
         categorized = {
-            "Primary": [],
-            "Social": [],
-            "Promotions": [],
-            "Updates": [],
-            "Finance & Bills": [],
-            "Travel": []
+            "Primary": [], "Social": [], "Promotions": [], 
+            "Updates": [], "Finance & Bills": [], "Travel": []
         }
 
         for msg in messages:
@@ -135,10 +145,8 @@ def get_emails():
             headers = payload.get('headers', [])
             snippet = m.get('snippet', '')
             
-            # Extract meta
             subject = next((h['value'] for h in headers if h['name'] == 'Subject'), '(No Subject)')
             sender = next((h['value'] for h in headers if h['name'] == 'From'), 'Unknown')
-            
             cat = categorize_email(headers, snippet)
             
             categorized[cat].append({
@@ -155,5 +163,4 @@ def get_emails():
         return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
-    # Ensure templates folder exists and files are correct
     app.run(port=5000, debug=True)
