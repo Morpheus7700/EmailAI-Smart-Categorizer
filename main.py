@@ -21,26 +21,27 @@ else:
 SCOPES = ['https://www.googleapis.com/auth/gmail.readonly', 'https://www.googleapis.com/auth/userinfo.profile', 'openid']
 
 def get_google_config():
-    """Returns and unwraps the Google Client Config from Env Var"""
+    """Returns the Google Client Config in the format expected by google-auth-oauthlib"""
     env_config = os.environ.get('GOOGLE_CLIENT_CONFIG')
-    if not env_config:
-        # Check for local file fallback
-        client_secrets_file = "client_secret_555314315936-rr3b7ufe3e3l5dgd62vvsrcqe662lkpo.apps.googleusercontent.com.json"
-        if os.path.exists(client_secrets_file):
-            with open(client_secrets_file, 'r') as f:
-                config = json.load(f)
-        else:
-            return None
-    else:
+    config = None
+    
+    if env_config:
         try:
             config = json.loads(env_config)
         except Exception as e:
             print(f"JSON Parse Error: {e}", file=sys.stderr)
             return None
+    else:
+        # Fallback to local file
+        client_secrets_file = "client_secret_555314315936-rr3b7ufe3e3l5dgd62vvsrcqe662lkpo.apps.googleusercontent.com.json"
+        if os.path.exists(client_secrets_file):
+            with open(client_secrets_file, 'r') as f:
+                config = json.load(f)
     
-    # Unwrap "web" key if present
-    if config and 'web' in config:
-        return config['web']
+    # ENSURE WRAPPER: The library expects {"web": {...}} or {"installed": {...}}
+    if config and 'web' not in config and 'installed' not in config:
+        return {"web": config}
+    
     return config
 
 def get_flow(state=None):
