@@ -1,6 +1,7 @@
 import os
 import json
 import requests
+import sys
 from flask import Flask, render_template, redirect, url_for, session, jsonify, request
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
@@ -8,6 +9,7 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 
 app = Flask(__name__)
+# Use Environment Variable for secret key
 app.secret_key = os.environ.get('FLASK_SECRET_KEY', 'wealthwise-email-dev-key')
 
 # Force HTTPS for OAuth in production
@@ -19,69 +21,42 @@ else:
 SCOPES = ['https://www.googleapis.com/auth/gmail.readonly', 'https://www.googleapis.com/auth/userinfo.profile', 'openid']
 
 def get_google_config():
-    """Returns and unwraps the Google Client Config"""
+    """Returns and unwraps the Google Client Config from Env Var"""
     env_config = os.environ.get('GOOGLE_CLIENT_CONFIG')
-    config = None
-    
-    if env_config:
-        config = json.loads(env_config)
-    else:
-        # Fallback to local file
+    if not env_config:
+        # Check for local file fallback
         client_secrets_file = "client_secret_555314315936-rr3b7ufe3e3l5dgd62vvsrcqe662lkpo.apps.googleusercontent.com.json"
         if os.path.exists(client_secrets_file):
             with open(client_secrets_file, 'r') as f:
                 config = json.load(f)
+        else:
+            return None
+    else:
+        try:
+            config = json.loads(env_config)
+        except Exception as e:
+            print(f"JSON Parse Error: {e}", file=sys.stderr)
+            return None
     
+    # Unwrap "web" key if present
     if config and 'web' in config:
-        return config['web'] # Unwrap the "web" key
+        return config['web']
     return config
 
 def get_flow(state=None):
     config = get_google_config()
     if not config:
-        raise Exception("Google Client Configuration missing!")
+        raise ValueError("Google Client Configuration is missing or invalid. Check GOOGLE_CLIENT_CONFIG in Vercel.")
     
     flow = Flow.from_client_config(config, scopes=SCOPES, state=state)
     
-    # FORCE EXACT REDIRECT URI from your Google Console Screenshot
+    # Use the official domain for Vercel
     if os.environ.get('VERCEL_URL'):
-        # We use the official domain to ensure it matches the Google whitelist perfectly
         flow.redirect_uri = "https://email-ai-smart-categorizer.vercel.app/authorized"
     else:
         flow.redirect_uri = url_for('authorize', _external=True)
     
     return flow
-
-@app.route('/')
-def index():
-    if 'credentials' in session:
-        return render_template('dashboard.html', user=session.get('user_info'))
-    return render_template('dashboard.html', user=None)
-
-@app.route('/login')
-def login():
-    flow = get_flow()
-    authorization_url, state = flow.authorization_url(access_type='offline', include_granted_scopes='true')
-    session['state'] = state
-    return redirect(authorization_url)
-
-@app.route('/authorized')
-def authorize():
-    flow = get_flow(state=session.get('state'))
-    
-    authorization_response = request.url
-    if 'http://' in authorization_response and os.environ.get('VERCEL_URL'):
-        authorization_response = authorization_response.replace('http://', 'https://')
-        
-    flow.fetch_token(authorization_response=authorization_response)
-    
-    credentials = flow.credentials
-    session['credentials'] = credentials_to_dict(credentials)
-    
-    user_info = build('oauth2', 'v2', credentials=credentials).userinfo().get().execute()
-    session['user_info'] = user_info
-    
-    return redirect(url_for('index'))
 
 def credentials_to_dict(credentials):
     return {
@@ -92,6 +67,18 @@ def credentials_to_dict(credentials):
         'client_secret': credentials.client_secret,
         'scopes': credentials.scopes
     }
+
+def get_gmail_service():
+    if 'credentials' not in session:
+        return None
+    creds = Credentials(**session['credentials'])
+    if creds.expired and creds.refresh_token:
+        try:
+            creds.refresh(Request())
+            session['credentials'] = credentials_to_dict(creds)
+        except Exception:
+            return None
+    return build('gmail', 'v1', credentials=creds)
 
 def categorize_email(headers, snippet):
     subject = ""
@@ -113,6 +100,45 @@ def categorize_email(headers, snippet):
     if any(x in subject for x in ['flight', 'hotel', 'booking', 'reservation', 'ticket']):
         return "Travel"
     return "Primary"
+
+@app.route('/')
+def index():
+    if 'credentials' in session:
+        return render_template('dashboard.html', user=session.get('user_info'))
+    return render_template('dashboard.html', user=None)
+
+@app.route('/login')
+def login():
+    try:
+        flow = get_flow()
+        authorization_url, state = flow.authorization_url(access_type='offline', include_granted_scopes='true')
+        session['state'] = state
+        return redirect(authorization_url)
+    except Exception as e:
+        # This will show the actual error in the browser if it crashes
+        return f"Login Error: {str(e)}", 500
+
+@app.route('/authorized')
+def authorize():
+    try:
+        flow = get_flow(state=session.get('state'))
+        authorization_response = request.url
+        if 'http://' in authorization_response and os.environ.get('VERCEL_URL'):
+            authorization_response = authorization_response.replace('http://', 'https://')
+            
+        flow.fetch_token(authorization_response=authorization_response)
+        
+        credentials = flow.credentials
+        session['credentials'] = credentials_to_dict(credentials)
+        
+        # Build OAuth2 service to get user info
+        oauth2_service = build('oauth2', 'v2', credentials=credentials)
+        user_info = oauth2_service.userinfo().get().execute()
+        session['user_info'] = user_info
+        
+        return redirect(url_for('index'))
+    except Exception as e:
+        return f"Authorization Error: {str(e)}", 500
 
 @app.route('/logout')
 def logout():
@@ -156,15 +182,6 @@ def get_emails():
         return jsonify(categorized)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
-def get_gmail_service():
-    if 'credentials' not in session:
-        return None
-    creds = Credentials(**session['credentials'])
-    if creds.expired and creds.refresh_token:
-        creds.refresh(Request())
-        session['credentials'] = credentials_to_dict(creds)
-    return build('gmail', 'v1', credentials=creds)
 
 if __name__ == '__main__':
     app.run(port=5000, debug=True)
