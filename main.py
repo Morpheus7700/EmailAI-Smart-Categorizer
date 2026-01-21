@@ -8,19 +8,16 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 
 app = Flask(__name__)
-# Use Environment Variable for secret key in production
 app.secret_key = os.environ.get('FLASK_SECRET_KEY', 'wealthwise-email-dev-key')
 
 # Configuration
 SCOPES = ['https://www.googleapis.com/auth/gmail.readonly', 'https://www.googleapis.com/auth/userinfo.profile', 'openid']
 
 def get_google_config():
-    """Returns the Google Client Config from Env Var or Local File"""
     env_config = os.environ.get('GOOGLE_CLIENT_CONFIG')
     if env_config:
         return json.loads(env_config)
     
-    # Fallback to local file
     client_secrets_file = "client_secret_555314315936-rr3b7ufe3e3l5dgd62vvsrcqe662lkpo.apps.googleusercontent.com.json"
     if os.path.exists(client_secrets_file):
         with open(client_secrets_file, 'r') as f:
@@ -30,30 +27,52 @@ def get_google_config():
 def get_flow(state=None):
     config = get_google_config()
     if not config:
-        raise Exception("Google Client Configuration missing! Add GOOGLE_CLIENT_CONFIG to Vercel Env Vars.")
+        raise Exception("Google Client Configuration missing!")
     
     flow = Flow.from_client_config(config, scopes=SCOPES, state=state)
     
-    # In production (Vercel), we must use HTTPS
-    # We can detect if we are on Vercel by checking for VERCEL_URL
+    # DYNAMIC REDIRECT URI:
+    # This will use the actual domain you are visiting (e.g. email-ai-smart-categorizer.vercel.app)
+    # and appends /authorized to match your Google Console screenshot.
     if os.environ.get('VERCEL_URL'):
-        flow.redirect_uri = f"https://{os.environ.get('VERCEL_URL')}/authorize"
+        # On Vercel, we force HTTPS and use the host from the request
+        flow.redirect_uri = f"https://{request.host}/authorized"
     else:
-        # Standard local redirect
         flow.redirect_uri = url_for('authorize', _external=True)
     
     return flow
 
-def get_gmail_service():
-    if 'credentials' not in session:
-        return None
+@app.route('/')
+def index():
+    if 'credentials' in session:
+        return render_template('dashboard.html', user=session.get('user_info'))
+    return render_template('dashboard.html', user=None)
+
+@app.route('/login')
+def login():
+    flow = get_flow()
+    authorization_url, state = flow.authorization_url(access_type='offline', include_granted_scopes='true')
+    session['state'] = state
+    return redirect(authorization_url)
+
+# CHANGED: Added the 'd' to match your Google Console screenshot
+@app.route('/authorized')
+def authorize():
+    flow = get_flow(state=session.get('state'))
     
-    creds = Credentials(**session['credentials'])
-    if creds.expired and creds.refresh_token:
-        creds.refresh(Request())
-        session['credentials'] = credentials_to_dict(creds)
+    authorization_response = request.url
+    if 'https' not in authorization_response and os.environ.get('VERCEL_URL'):
+        authorization_response = authorization_response.replace('http', 'https')
         
-    return build('gmail', 'v1', credentials=creds)
+    flow.fetch_token(authorization_response=authorization_response)
+    
+    credentials = flow.credentials
+    session['credentials'] = credentials_to_dict(credentials)
+    
+    user_info = build('oauth2', 'v2', credentials=credentials).userinfo().get().execute()
+    session['user_info'] = user_info
+    
+    return redirect(url_for('index'))
 
 def credentials_to_dict(credentials):
     return {
@@ -69,7 +88,6 @@ def categorize_email(headers, snippet):
     subject = ""
     sender = ""
     list_unsubscribe = False
-    
     for h in headers:
         if h['name'] == 'Subject': subject = h['value'].lower()
         if h['name'] == 'From': sender = h['value'].lower()
@@ -86,38 +104,6 @@ def categorize_email(headers, snippet):
     if any(x in subject for x in ['flight', 'hotel', 'booking', 'reservation', 'ticket']):
         return "Travel"
     return "Primary"
-
-@app.route('/')
-def index():
-    if 'credentials' in session:
-        return render_template('dashboard.html', user=session.get('user_info'))
-    return render_template('dashboard.html', user=None)
-
-@app.route('/login')
-def login():
-    flow = get_flow()
-    authorization_url, state = flow.authorization_url(access_type='offline', include_granted_scopes='true')
-    session['state'] = state
-    return redirect(authorization_url)
-
-@app.route('/authorize')
-def authorize():
-    flow = get_flow(state=session.get('state'))
-    
-    authorization_response = request.url
-    # Workaround for Vercel/Proxy redirect issues with HTTP/HTTPS
-    if 'https' not in authorization_response and os.environ.get('VERCEL_URL'):
-        authorization_response = authorization_response.replace('http', 'https')
-        
-    flow.fetch_token(authorization_response=authorization_response)
-    
-    credentials = flow.credentials
-    session['credentials'] = credentials_to_dict(credentials)
-    
-    user_info = build('oauth2', 'v2', credentials=credentials).userinfo().get().execute()
-    session['user_info'] = user_info
-    
-    return redirect(url_for('index'))
 
 @app.route('/logout')
 def logout():
@@ -161,6 +147,15 @@ def get_emails():
         return jsonify(categorized)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+def get_gmail_service():
+    if 'credentials' not in session:
+        return None
+    creds = Credentials(**session['credentials'])
+    if creds.expired and creds.refresh_token:
+        creds.refresh(Request())
+        session['credentials'] = credentials_to_dict(creds)
+    return build('gmail', 'v1', credentials=creds)
 
 if __name__ == '__main__':
     app.run(port=5000, debug=True)
