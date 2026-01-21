@@ -1,5 +1,4 @@
 {
-  "rewriteRuntime": "python3.9",
   "rewrites": [
     {
       "source": "/(.*)",
