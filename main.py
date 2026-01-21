@@ -12,8 +12,13 @@ app = Flask(__name__)
 # Use Environment Variable for secret key
 app.secret_key = os.environ.get('FLASK_SECRET_KEY', 'wealthwise-email-dev-key')
 
-# Force HTTPS for OAuth in production
+# Vercel-specific session cookie settings to prevent state mismatch
 if os.environ.get('VERCEL_URL'):
+    app.config.update(
+        SESSION_COOKIE_SECURE=True,
+        SESSION_COOKIE_HTTPONLY=True,
+        SESSION_COOKIE_SAMESITE='Lax',
+    )
     os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = '0'
 else:
     os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = '1'
@@ -21,86 +26,38 @@ else:
 SCOPES = ['https://www.googleapis.com/auth/gmail.readonly', 'https://www.googleapis.com/auth/userinfo.profile', 'openid']
 
 def get_google_config():
-    """Returns the Google Client Config in the format expected by google-auth-oauthlib"""
+    """Returns and unwraps the Google Client Config from Env Var"""
     env_config = os.environ.get('GOOGLE_CLIENT_CONFIG')
     config = None
-    
     if env_config:
         try:
             config = json.loads(env_config)
         except Exception as e:
-            print(f"JSON Parse Error: {e}", file=sys.stderr)
             return None
     else:
-        # Fallback to local file
         client_secrets_file = "client_secret_555314315936-rr3b7ufe3e3l5dgd62vvsrcqe662lkpo.apps.googleusercontent.com.json"
         if os.path.exists(client_secrets_file):
             with open(client_secrets_file, 'r') as f:
                 config = json.load(f)
     
-    # ENSURE WRAPPER: The library expects {"web": {...}} or {"installed": {...}}
-    if config and 'web' not in config and 'installed' not in config:
-        return {"web": config}
-    
+    if config and 'web' in config:
+        return config['web']
     return config
 
 def get_flow(state=None):
     config = get_google_config()
     if not config:
-        raise ValueError("Google Client Configuration is missing or invalid. Check GOOGLE_CLIENT_CONFIG in Vercel.")
+        raise ValueError("Google Client Configuration is missing or invalid.")
     
     flow = Flow.from_client_config(config, scopes=SCOPES, state=state)
     
-    # Use the official domain for Vercel
+    # Hardcoded redirect to match your screenshot exactly
     if os.environ.get('VERCEL_URL'):
         flow.redirect_uri = "https://email-ai-smart-categorizer.vercel.app/authorized"
     else:
         flow.redirect_uri = url_for('authorize', _external=True)
     
     return flow
-
-def credentials_to_dict(credentials):
-    return {
-        'token': credentials.token,
-        'refresh_token': credentials.refresh_token,
-        'token_uri': credentials.token_uri,
-        'client_id': credentials.client_id,
-        'client_secret': credentials.client_secret,
-        'scopes': credentials.scopes
-    }
-
-def get_gmail_service():
-    if 'credentials' not in session:
-        return None
-    creds = Credentials(**session['credentials'])
-    if creds.expired and creds.refresh_token:
-        try:
-            creds.refresh(Request())
-            session['credentials'] = credentials_to_dict(creds)
-        except Exception:
-            return None
-    return build('gmail', 'v1', credentials=creds)
-
-def categorize_email(headers, snippet):
-    subject = ""
-    sender = ""
-    list_unsubscribe = False
-    for h in headers:
-        if h['name'] == 'Subject': subject = h['value'].lower()
-        if h['name'] == 'From': sender = h['value'].lower()
-        if h['name'] == 'List-Unsubscribe': list_unsubscribe = True
-
-    if any(x in sender for x in ['facebook', 'twitter', 'linkedin', 'instagram', 'youtube']):
-        return "Social"
-    if any(x in subject for x in ['invoice', 'bill', 'receipt', 'payment', 'order', 'statement', 'transaction']):
-        return "Finance & Bills"
-    if list_unsubscribe or any(x in sender for x in ['newsletter', 'marketing', 'info@', 'no-reply@']):
-        return "Promotions"
-    if any(x in subject for x in ['update', 'security', 'alert', 'verify', 'confirm']):
-        return "Updates"
-    if any(x in subject for x in ['flight', 'hotel', 'booking', 'reservation', 'ticket']):
-        return "Travel"
-    return "Primary"
 
 @app.route('/')
 def index():
@@ -116,13 +73,18 @@ def login():
         session['state'] = state
         return redirect(authorization_url)
     except Exception as e:
-        # This will show the actual error in the browser if it crashes
         return f"Login Error: {str(e)}", 500
 
 @app.route('/authorized')
 def authorize():
     try:
-        flow = get_flow(state=session.get('state'))
+        # Get state from session
+        state = session.get('state')
+        if not state:
+            return "Authorization Error: State missing in session. Please try logging in again.", 400
+            
+        flow = get_flow(state=state)
+        
         authorization_response = request.url
         if 'http://' in authorization_response and os.environ.get('VERCEL_URL'):
             authorization_response = authorization_response.replace('http://', 'https://')
@@ -137,9 +99,22 @@ def authorize():
         user_info = oauth2_service.userinfo().get().execute()
         session['user_info'] = user_info
         
+        # Clean up state
+        session.pop('state', None)
+        
         return redirect(url_for('index'))
     except Exception as e:
         return f"Authorization Error: {str(e)}", 500
+
+def credentials_to_dict(credentials):
+    return {
+        'token': credentials.token,
+        'refresh_token': credentials.refresh_token,
+        'token_uri': credentials.token_uri,
+        'client_id': credentials.client_id,
+        'client_secret': credentials.client_secret,
+        'scopes': credentials.scopes
+    }
 
 @app.route('/logout')
 def logout():
@@ -148,9 +123,18 @@ def logout():
 
 @app.route('/api/emails')
 def get_emails():
-    service = get_gmail_service()
-    if not service:
+    if 'credentials' not in session:
         return jsonify({"error": "Unauthorized"}), 401
+    
+    creds = Credentials(**session['credentials'])
+    if creds.expired and creds.refresh_token:
+        try:
+            creds.refresh(Request())
+            session['credentials'] = credentials_to_dict(creds)
+        except:
+            return jsonify({"error": "Auth Refresh Failed"}), 401
+            
+    service = build('gmail', 'v1', credentials=creds)
 
     try:
         results = service.users().messages().list(userId='me', maxResults=50).execute()
@@ -169,7 +153,17 @@ def get_emails():
             
             subject = next((h['value'] for h in headers if h['name'] == 'Subject'), '(No Subject)')
             sender = next((h['value'] for h in headers if h['name'] == 'From'), 'Unknown')
-            cat = categorize_email(headers, snippet)
+            
+            # Simple Categorization
+            cat = "Primary"
+            sender_l = sender.lower()
+            subj_l = subject.lower()
+            
+            if any(x in sender_l for x in ['facebook', 'twitter', 'linkedin', 'instagram', 'youtube']): cat = "Social"
+            elif any(x in subj_l for x in ['invoice', 'bill', 'receipt', 'payment', 'order']): cat = "Finance & Bills"
+            elif any(x in subj_l for x in ['flight', 'hotel', 'booking']): cat = "Travel"
+            elif 'newsletter' in sender_l or 'marketing' in sender_l: cat = "Promotions"
+            elif 'update' in subj_l or 'security' in subj_l: cat = "Updates"
             
             categorized[cat].append({
                 "id": msg['id'],
