@@ -26,13 +26,13 @@ else:
 SCOPES = ['https://www.googleapis.com/auth/gmail.readonly', 'https://www.googleapis.com/auth/userinfo.profile', 'openid']
 
 def get_google_config():
-    """Returns and unwraps the Google Client Config from Env Var"""
+    """Returns the Google Client Config in the format expected by the library"""
     env_config = os.environ.get('GOOGLE_CLIENT_CONFIG')
     config = None
     if env_config:
         try:
             config = json.loads(env_config)
-        except Exception as e:
+        except Exception:
             return None
     else:
         client_secrets_file = "client_secret_555314315936-rr3b7ufe3e3l5dgd62vvsrcqe662lkpo.apps.googleusercontent.com.json"
@@ -40,8 +40,12 @@ def get_google_config():
             with open(client_secrets_file, 'r') as f:
                 config = json.load(f)
     
-    if config and 'web' in config:
-        return config['web']
+    # The library expects {"web": {...}} or {"installed": {...}}
+    # If the user provided the inner dict, wrap it.
+    # If the user provided the full dict (which you did), keep it as is.
+    if config and 'web' not in config and 'installed' not in config:
+        return {"web": config}
+    
     return config
 
 def get_flow(state=None):
