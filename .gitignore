@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+
+# Secrets
+client_secret_*.json
+credentials.json
+
+# Environment
+.env

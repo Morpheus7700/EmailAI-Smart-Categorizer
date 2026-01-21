@@ -1,0 +1,9 @@
+{
+  "rewriteRuntime": "python3.9",
+  "rewrites": [
+    {
+      "source": "/(.*)",
+      "destination": "/EmailCateg V01.py"
+    }
+  ]
+}
