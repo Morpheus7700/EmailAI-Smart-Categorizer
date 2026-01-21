@@ -9,15 +9,17 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 
 app = Flask(__name__)
-# Use Environment Variable for secret key
+# IMPORTANT: Ensure FLASK_SECRET_KEY is set in Vercel Env Vars. 
+# If not, sessions will reset on every redeploy/cold start.
 app.secret_key = os.environ.get('FLASK_SECRET_KEY', 'wealthwise-email-dev-key')
 
-# Vercel-specific session cookie settings to prevent state mismatch
+# Vercel Proxy Fixes
 if os.environ.get('VERCEL_URL'):
     app.config.update(
         SESSION_COOKIE_SECURE=True,
         SESSION_COOKIE_HTTPONLY=True,
-        SESSION_COOKIE_SAMESITE='Lax',
+        SESSION_COOKIE_SAMESITE='Lax', # Required for cross-site redirects (Google -> App)
+        PREFERRED_URL_SCHEME='https'
     )
     os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = '0'
 else:
@@ -26,7 +28,6 @@ else:
 SCOPES = ['https://www.googleapis.com/auth/gmail.readonly', 'https://www.googleapis.com/auth/userinfo.profile', 'openid']
 
 def get_google_config():
-    """Returns the Google Client Config in the format expected by the library"""
     env_config = os.environ.get('GOOGLE_CLIENT_CONFIG')
     config = None
     if env_config:
@@ -40,24 +41,23 @@ def get_google_config():
             with open(client_secrets_file, 'r') as f:
                 config = json.load(f)
     
-    # The library expects {"web": {...}} or {"installed": {...}}
-    # If the user provided the inner dict, wrap it.
-    # If the user provided the full dict (which you did), keep it as is.
-    if config and 'web' not in config and 'installed' not in config:
-        return {"web": config}
-    
+    if config and 'web' in config:
+        return config['web']
     return config
 
 def get_flow(state=None):
     config = get_google_config()
     if not config:
-        raise ValueError("Google Client Configuration is missing or invalid.")
+        raise ValueError("Google Client Configuration is missing.")
     
     flow = Flow.from_client_config(config, scopes=SCOPES, state=state)
     
-    # Hardcoded redirect to match your screenshot exactly
+    # DYNAMIC REDIRECT URI
+    # Instead of hardcoding, we use the host that the user is actually visiting.
+    # This handles both the .vercel.app domain and any custom domains.
     if os.environ.get('VERCEL_URL'):
-        flow.redirect_uri = "https://email-ai-smart-categorizer.vercel.app/authorized"
+        # On Vercel, force HTTPS and use the current host
+        flow.redirect_uri = f"https://{request.host}/authorized"
     else:
         flow.redirect_uri = url_for('authorize', _external=True)
     
@@ -73,8 +73,14 @@ def index():
 def login():
     try:
         flow = get_flow()
-        authorization_url, state = flow.authorization_url(access_type='offline', include_granted_scopes='true')
+        authorization_url, state = flow.authorization_url(
+            access_type='offline', 
+            include_granted_scopes='true',
+            prompt='select_account' # Forces account selection to prevent auto-login loops
+        )
         session['state'] = state
+        # Ensure session is saved before redirecting
+        session.modified = True
         return redirect(authorization_url)
     except Exception as e:
         return f"Login Error: {str(e)}", 500
@@ -82,29 +88,32 @@ def login():
 @app.route('/authorized')
 def authorize():
     try:
-        # Get state from session
+        # 1. Retrieve the state we stored in /login
         state = session.get('state')
         if not state:
-            return "Authorization Error: State missing in session. Please try logging in again.", 400
+            return "Authorization Error: Session state missing. Please enable cookies and try again.", 400
             
         flow = get_flow(state=state)
         
+        # 2. Reconstruct the full URL for verification
+        # Google returns the response to the Vercel proxy via HTTP internally.
+        # We must force it back to HTTPS for the library to validate it.
         authorization_response = request.url
-        if 'http://' in authorization_response and os.environ.get('VERCEL_URL'):
-            authorization_response = authorization_response.replace('http://', 'https://')
+        if os.environ.get('VERCEL_URL') and authorization_response.startswith('http://'):
+            authorization_response = authorization_response.replace('http://', 'https://', 1)
             
         flow.fetch_token(authorization_response=authorization_response)
         
+        # 3. Save credentials and user info
         credentials = flow.credentials
         session['credentials'] = credentials_to_dict(credentials)
         
-        # Build OAuth2 service to get user info
-        oauth2_service = build('oauth2', 'v2', credentials=credentials)
-        user_info = oauth2_service.userinfo().get().execute()
+        user_info = build('oauth2', 'v2', credentials=credentials).userinfo().get().execute()
         session['user_info'] = user_info
         
-        # Clean up state
+        # 4. Cleanup
         session.pop('state', None)
+        session.modified = True
         
         return redirect(url_for('index'))
     except Exception as e:
@@ -158,7 +167,6 @@ def get_emails():
             subject = next((h['value'] for h in headers if h['name'] == 'Subject'), '(No Subject)')
             sender = next((h['value'] for h in headers if h['name'] == 'From'), 'Unknown')
             
-            # Simple Categorization
             cat = "Primary"
             sender_l = sender.lower()
             subj_l = subject.lower()
