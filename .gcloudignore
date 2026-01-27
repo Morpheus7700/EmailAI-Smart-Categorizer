@@ -1,0 +1,93 @@
+.git
+.gitignore
+__pycache__/
+*.py[cod]
+*$py.class
+auth_output.txt
+latest_build_id.txt
+project_analysis.md
+task.md
+implementation_plan.md
+cloud_run_guide.md
+.gemini/
+.agent/
+node_modules/
+dist/
+.env
+.venv
+venv/
+env/
+bin/
+lib/
+share/
+include/
+ client_secret_*.json
+ .gitattributes
+ .git/
+ .vscode/
+ .idea/
+ .python-version
+ .DS_Store
+ .npm/
+ .npmrc
+ .yarn/
+ .yarnrc
+ .cache/
+ .pytest_cache/
+ .coverage
+ .tox/
+ .nox/
+ .mypy_cache/
+ .ipynb_checkpoints/
+ .npmrc
+ .lock-wscript
+ .eslintcache
+ .pnp*
+ .npm/
+ .yarn/
+ .vercel/
+ .vercel_cache/
+ .next/
+ .out/
+ .build/
+ .serverless/
+ .webpack/
+ .dynamodb/
+ .serverless_nextjs/
+ .nx/
+ .turbo/
+ .docusaurus/
+ .cache/
+ .DS_Store
+ Thumbs.db
+ Desktop.ini
+ 
+ .gcloudignore
+ .git
+ .gitignore
+ .gitattributes
+ .git/
+ .vscode/
+ .idea/
+ 
+# ignore vercel stuff
+ vercel.json
+ 
+# ignore agent stuff
+ .agent/
+ .gemini/
+ 
+# ignore build stuff
+ __pycache__/
+ *.py[cod]
+ 
+# ignore docs
+ *.md
+ task.md
+ project_analysis.md
+ implementation_plan.md
+ cloud_run_guide.md
+ 
+# ignore logs
+ auth_output.txt
+ latest_build_id.txt

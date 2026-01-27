@@ -13,8 +13,11 @@ app = Flask(__name__)
 # If not, sessions will reset on every redeploy/cold start.
 app.secret_key = os.environ.get('FLASK_SECRET_KEY', 'wealthwise-email-dev-key')
 
-# Vercel Proxy Fixes
-if os.environ.get('VERCEL_URL'):
+# Production / Proxy Configuration (Cloud Run, Vercel, etc.)
+# Check for K_SERVICE (Cloud Run) or VERCEL_URL (Vercel) to detect production environment
+is_production = os.environ.get('K_SERVICE') or os.environ.get('VERCEL_URL')
+
+if is_production:
     app.config.update(
         SESSION_COOKIE_SECURE=True,
         SESSION_COOKIE_HTTPONLY=True,
@@ -52,10 +55,11 @@ def get_flow(state=None):
     flow = Flow.from_client_config(config, scopes=SCOPES, state=state)
     
     # DYNAMIC REDIRECT URI
-    # Instead of hardcoding, we use the host that the user is actually visiting.
-    # This handles both the .vercel.app domain and any custom domains.
-    if os.environ.get('VERCEL_URL'):
-        # On Vercel, force HTTPS and use the current host
+    # Support explicit overwrite via env var (Best for Cloud Run/Production)
+    if os.environ.get('REDIRECT_URI'):
+        flow.redirect_uri = os.environ['REDIRECT_URI']
+    elif is_production:
+        # On Cloud Run/Vercel, force HTTPS and use the current host
         flow.redirect_uri = f"https://{request.host}/authorized"
     else:
         flow.redirect_uri = url_for('authorize', _external=True)
@@ -98,8 +102,11 @@ def authorize():
         # Google returns the response to the Vercel proxy via HTTP internally.
         # We must force it back to HTTPS for the library to validate it.
         authorization_response = request.url
-        if os.environ.get('VERCEL_URL') and authorization_response.startswith('http://'):
-            authorization_response = authorization_response.replace('http://', 'https://', 1)
+        
+        # FIX: Ensure HTTPS is used for validation if running behind a proxy (Vercel/Cloud Run)
+        # Cloud Run sets K_SERVICE, Vercel sets VERCEL_URL
+        if is_production and authorization_response.startswith('http://'):
+             authorization_response = authorization_response.replace('http://', 'https://', 1)
             
         flow.fetch_token(authorization_response=authorization_response)
         

@@ -11,3 +11,4 @@ credentials.json
 
 # Environment
 .env
+client_secret.json
