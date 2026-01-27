@@ -140,6 +140,45 @@ def logout():
     session.clear()
     return redirect(url_for('index'))
 
+import google.generativeai as genai
+
+# Setup Gemini
+GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+    model = genai.GenerativeModel('gemini-1.5-flash')
+
+def ai_categorize_batch(emails):
+    """Uses Gemini to categorize a batch of emails based on context."""
+    if not GEMINI_API_KEY:
+        return None # Fallback to manual
+    
+    prompt = """
+    Categorize the following emails into exactly one of these categories: 
+    'Primary', 'Social', 'Promotions', 'Updates', 'Finance & Bills', 'Travel'.
+    
+    Context Rules:
+    - 'Finance & Bills': Invoices, receipts, bank alerts, salary, or payment confirmations.
+    - 'Social': Notifications from LinkedIn, Facebook, Twitter, etc.
+    - 'Travel': Flight bookings, hotel stays, or trip itineraries.
+    - 'Promotions': Marketing, newsletters, or sales offers.
+    - 'Updates': Security alerts, system notifications, or status updates.
+    - 'Primary': Personal conversations or important direct work emails.
+
+    Return the result as a JSON array of strings in the same order as the emails provided.
+    Only return the JSON array, nothing else.
+    """
+    
+    email_data = [f"Sub: {e['subject']} | Snippet: {e['snippet']}" for e in emails]
+    try:
+        response = model.generate_content(prompt + "\n" + json.dumps(email_data))
+        # Extract JSON from response (handling potential markdown formatting)
+        clean_response = response.text.strip().replace('```json', '').replace('```', '')
+        return json.loads(clean_response)
+    except Exception as e:
+        print(f"AI Error: {e}")
+        return None
+
 @app.route('/api/emails')
 def get_emails():
     if 'credentials' not in session:
@@ -156,41 +195,49 @@ def get_emails():
     service = build('gmail', 'v1', credentials=creds)
 
     try:
-        results = service.users().messages().list(userId='me', maxResults=50).execute()
+        # Increased to 100 emails
+        results = service.users().messages().list(userId='me', maxResults=100).execute()
         messages = results.get('messages', [])
         
+        email_list = []
+        for msg in messages:
+            m = service.users().messages().get(userId='me', id=msg['id'], format='full').execute()
+            payload = m.get('payload', {})
+            headers = payload.get('headers', [])
+            
+            email_list.append({
+                "id": msg['id'],
+                "subject": next((h['value'] for h in headers if h['name'] == 'Subject'), '(No Subject)'),
+                "from": next((h['value'] for h in headers if h['name'] == 'From'), 'Unknown'),
+                "snippet": m.get('snippet', ''),
+                "date": next((h['value'] for h in headers if h['name'] == 'Date'), ''),
+                "url": f"https://mail.google.com/mail/u/0/#inbox/{msg['id']}"
+            })
+
+        # Smart Categorization
         categorized = {
             "Primary": [], "Social": [], "Promotions": [], 
             "Updates": [], "Finance & Bills": [], "Travel": []
         }
 
-        for msg in messages:
-            m = service.users().messages().get(userId='me', id=msg['id'], format='full').execute()
-            payload = m.get('payload', {})
-            headers = payload.get('headers', [])
-            snippet = m.get('snippet', '')
+        # Batch process with AI in chunks of 20 to avoid prompt limits
+        for i in range(0, len(email_list), 20):
+            batch = email_list[i:i+20]
+            categories = ai_categorize_batch(batch)
             
-            subject = next((h['value'] for h in headers if h['name'] == 'Subject'), '(No Subject)')
-            sender = next((h['value'] for h in headers if h['name'] == 'From'), 'Unknown')
-            
-            cat = "Primary"
-            sender_l = sender.lower()
-            subj_l = subject.lower()
-            
-            if any(x in sender_l for x in ['facebook', 'twitter', 'linkedin', 'instagram', 'youtube']): cat = "Social"
-            elif any(x in subj_l for x in ['invoice', 'bill', 'receipt', 'payment', 'order']): cat = "Finance & Bills"
-            elif any(x in subj_l for x in ['flight', 'hotel', 'booking']): cat = "Travel"
-            elif 'newsletter' in sender_l or 'marketing' in sender_l: cat = "Promotions"
-            elif 'update' in subj_l or 'security' in subj_l: cat = "Updates"
-            
-            categorized[cat].append({
-                "id": msg['id'],
-                "subject": subject,
-                "from": sender,
-                "snippet": snippet,
-                "date": next((h['value'] for h in headers if h['name'] == 'Date'), ''),
-                "url": f"https://mail.google.com/mail/u/0/#inbox/{msg['id']}"
-            })
+            for j, email in enumerate(batch):
+                cat = "Primary" # Default
+                if categories and j < len(categories):
+                    cat = categories[j]
+                else:
+                    # Fallback keyword logic if AI fails
+                    sender_l = email['from'].lower()
+                    subj_l = email['subject'].lower()
+                    if any(x in sender_l for x in ['facebook', 'linkedin', 'instagram']): cat = "Social"
+                    elif any(x in subj_l for x in ['invoice', 'bill', 'receipt']): cat = "Finance & Bills"
+                
+                if cat not in categorized: cat = "Primary"
+                categorized[cat].append(email)
 
         return jsonify(categorized)
     except Exception as e:
