@@ -36,7 +36,8 @@ def get_google_config():
         except Exception:
             return None
     else:
-        client_secrets_file = "client_secret_555314315936-rr3b7ufe3e3l5dgd62vvsrcqe662lkpo.apps.googleusercontent.com.json"
+        # Try generic name first, then specific if needed
+        client_secrets_file = "client_secret.json"
         if os.path.exists(client_secrets_file):
             with open(client_secrets_file, 'r') as f:
                 config = json.load(f)
