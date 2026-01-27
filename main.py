@@ -1,217 +1,189 @@
 import os
 import json
 import requests
-import sys
 from flask import Flask, render_template, redirect, url_for, session, jsonify, request
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
+import google.generativeai as genai
+from google.cloud import firestore
+from werkzeug.security import generate_password_hash, check_password_hash
 
 app = Flask(__name__)
-# IMPORTANT: Ensure FLASK_SECRET_KEY is set in Vercel Env Vars. 
-# If not, sessions will reset on every redeploy/cold start.
-app.secret_key = os.environ.get('FLASK_SECRET_KEY', 'wealthwise-email-dev-key')
+app.secret_key = os.environ.get('FLASK_SECRET_KEY', 'dev-key-123')
 
-# Production / Proxy Configuration (Cloud Run, Vercel, etc.)
-# Check for K_SERVICE (Cloud Run) or VERCEL_URL (Vercel) to detect production environment
+# Admin Email - REPLACE THIS WITH YOUR EMAIL
+ADMIN_EMAIL = "aniketroy2k@gmail.com"
+
+# Initialize Firestore
+# Note: In Cloud Run, it uses the service account automatically.
+db = firestore.Client()
+
+# Production / Proxy Configuration
 is_production = os.environ.get('K_SERVICE') or os.environ.get('VERCEL_URL')
-
 if is_production:
-    app.config.update(
-        SESSION_COOKIE_SECURE=True,
-        SESSION_COOKIE_HTTPONLY=True,
-        SESSION_COOKIE_SAMESITE='Lax', # Required for cross-site redirects (Google -> App)
-        PREFERRED_URL_SCHEME='https'
-    )
+    app.config.update(SESSION_COOKIE_SECURE=True, SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE='Lax')
     os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = '0'
 else:
     os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = '1'
 
-SCOPES = ['https://www.googleapis.com/auth/gmail.readonly', 'https://www.googleapis.com/auth/userinfo.profile', 'openid']
-
-def get_google_config():
-    env_config = os.environ.get('GOOGLE_CLIENT_CONFIG')
-    config = None
-    if env_config:
-        try:
-            config = json.loads(env_config)
-        except Exception:
-            return None
-    else:
-        # Try generic name first, then specific if needed
-        client_secrets_file = "client_secret.json"
-        if os.path.exists(client_secrets_file):
-            with open(client_secrets_file, 'r') as f:
-                config = json.load(f)
-    
-    return config
-
-def get_flow(state=None):
-    config = get_google_config()
-    if not config:
-        raise ValueError("Google Client Configuration is missing.")
-    
-    flow = Flow.from_client_config(config, scopes=SCOPES, state=state)
-    
-    # DYNAMIC REDIRECT URI
-    # Support explicit overwrite via env var (Best for Cloud Run/Production)
-    if os.environ.get('REDIRECT_URI'):
-        flow.redirect_uri = os.environ['REDIRECT_URI']
-    elif is_production:
-        # On Cloud Run/Vercel, force HTTPS and use the current host
-        flow.redirect_uri = f"https://{request.host}/authorized"
-    else:
-        flow.redirect_uri = url_for('authorize', _external=True)
-    
-    return flow
-
-@app.route('/')
-def index():
-    if 'credentials' in session:
-        return render_template('dashboard.html', user=session.get('user_info'))
-    return render_template('dashboard.html', user=None)
-
-@app.route('/login')
-def login():
-    try:
-        flow = get_flow()
-        authorization_url, state = flow.authorization_url(
-            access_type='offline', 
-            include_granted_scopes='true',
-            prompt='select_account' # Forces account selection to prevent auto-login loops
-        )
-        session['state'] = state
-        # Ensure session is saved before redirecting
-        session.modified = True
-        return redirect(authorization_url)
-    except Exception as e:
-        return f"Login Error: {str(e)}", 500
-
-@app.route('/authorized')
-def authorize():
-    try:
-        # 1. Retrieve the state we stored in /login
-        state = session.get('state')
-        if not state:
-            return "Authorization Error: Session state missing. Please enable cookies and try again.", 400
-            
-        flow = get_flow(state=state)
-        
-        # 2. Reconstruct the full URL for verification
-        # Google returns the response to the Vercel proxy via HTTP internally.
-        # We must force it back to HTTPS for the library to validate it.
-        authorization_response = request.url
-        
-        # FIX: Ensure HTTPS is used for validation if running behind a proxy (Vercel/Cloud Run)
-        # Cloud Run sets K_SERVICE, Vercel sets VERCEL_URL
-        if is_production and authorization_response.startswith('http://'):
-             authorization_response = authorization_response.replace('http://', 'https://', 1)
-            
-        flow.fetch_token(authorization_response=authorization_response)
-        
-        # 3. Save credentials and user info
-        credentials = flow.credentials
-        session['credentials'] = credentials_to_dict(credentials)
-        
-        user_info = build('oauth2', 'v2', credentials=credentials).userinfo().get().execute()
-        session['user_info'] = user_info
-        
-        # 4. Cleanup
-        session.pop('state', None)
-        session.modified = True
-        
-        return redirect(url_for('index'))
-    except Exception as e:
-        return f"Authorization Error: {str(e)}", 500
-
-def credentials_to_dict(credentials):
-    return {
-        'token': credentials.token,
-        'refresh_token': credentials.refresh_token,
-        'token_uri': credentials.token_uri,
-        'client_id': credentials.client_id,
-        'client_secret': credentials.client_secret,
-        'scopes': credentials.scopes
-    }
-
-@app.route('/logout')
-def logout():
-    session.clear()
-    return redirect(url_for('index'))
-
-import google.generativeai as genai
-
-# Setup Gemini
+# Gemini Setup
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
     model = genai.GenerativeModel('gemini-1.5-flash')
 
-def ai_categorize_batch(emails):
-    """Uses Gemini to categorize a batch of emails based on context."""
-    if not GEMINI_API_KEY:
-        print("DEBUG: No GEMINI_API_KEY found. Using manual fallback.")
-        return None
-    
-    prompt = """
-    You are an expert email organizer. Categorize these 20 emails into EXACTLY one of these buckets:
-    - 'Primary': Personal 1-to-1 emails, direct work communications, or important human-sent messages.
-    - 'Social': Notifications from LinkedIn, Facebook, Twitter, Instagram, YouTube, or dating apps.
-    - 'Promotions': Marketing emails, newsletters, sales, discounts, or coupons.
-    - 'Updates': Automated alerts, security notices, password resets, shipping updates, or service announcements.
-    - 'Finance & Bills': Bank statements, invoices, receipts, payment confirmations, or salary slips.
-    - 'Travel': Flight tickets, hotel bookings, car rentals, or trip itineraries.
+SCOPES = ['https://www.googleapis.com/auth/gmail.readonly', 'https://www.googleapis.com/auth/userinfo.profile', 'openid']
 
-    Rules:
-    1. Be aggressive. If it looks like a newsletter, it's 'Promotions'. If it's a notification from a service, it's 'Updates'.
-    2. Respond ONLY with a valid JSON list of strings (e.g., ["Primary", "Social", ...]).
-    3. The list MUST have exactly 20 items in the same order as the input.
-    """
+def get_google_config():
+    env_config = os.environ.get('GOOGLE_CLIENT_CONFIG')
+    if env_config:
+        return json.loads(env_config)
+    client_secrets_file = "client_secret.json"
+    if os.path.exists(client_secrets_file):
+        with open(client_secrets_file, 'r') as f:
+            return json.load(f)
+    return None
+
+def get_flow(state=None):
+    config = get_google_config()
+    if not config: raise ValueError("Google Client Configuration is missing.")
+    flow = Flow.from_client_config(config, scopes=SCOPES, state=state)
+    if os.environ.get('REDIRECT_URI'):
+        flow.redirect_uri = os.environ['REDIRECT_URI']
+    elif is_production:
+        flow.redirect_uri = f"https://{request.host}/authorized"
+    else:
+        flow.redirect_uri = url_for('authorize', _external=True)
+    return flow
+
+# --- USER ROUTES ---
+
+@app.route('/')
+def index():
+    user_id = session.get('user_id')
+    if not user_id:
+        return render_template('login.html')
     
-    email_data = [f"From: {e['from']} | Sub: {e['subject']} | Snippet: {e['snippet']}" for e in emails]
+    user_doc = db.collection('users').document(user_id).get()
+    if not user_doc.exists:
+        session.clear()
+        return redirect(url_for('login_page'))
+    
+    user_data = user_doc.to_dict()
+    return render_template('dashboard.html', user=user_data, is_admin=(user_data.get('email') == ADMIN_EMAIL))
+
+@app.route('/signup', methods=['GET', 'POST'])
+def signup():
+    if request.method == 'POST':
+        email = request.form.get('email')
+        password = request.form.get('password')
+        
+        user_ref = db.collection('users').document(email)
+        if user_ref.get().exists:
+            return "User already exists", 400
+        
+        user_ref.set({
+            'email': email,
+            'password': generate_password_hash(password),
+            'gmail_connected': False
+        })
+        session['user_id'] = email
+        return redirect(url_for('index'))
+    return render_template('signup.html')
+
+@app.route('/login', methods=['GET', 'POST'])
+def login_page():
+    if request.method == 'POST':
+        email = request.form.get('email')
+        password = request.form.get('password')
+        
+        user_doc = db.collection('users').document(email).get()
+        if user_doc.exists and check_password_hash(user_doc.to_dict()['password'], password):
+            session['user_id'] = email
+            return redirect(url_for('index'))
+        return "Invalid credentials", 401
+    return render_template('login.html')
+
+# --- GMAIL OAUTH ROUTES ---
+
+@app.route('/connect-gmail')
+def connect_gmail():
+    if 'user_id' not in session: return redirect(url_for('login_page'))
+    flow = get_flow()
+    auth_url, state = flow.authorization_url(access_type='offline', include_granted_scopes='true', prompt='consent')
+    session['state'] = state
+    return redirect(auth_url)
+
+@app.route('/authorized')
+def authorize():
     try:
-        response = model.generate_content(prompt + "\n\nEmails to categorize:\n" + json.dumps(email_data))
-        text = response.text.strip()
-        # Clean up Markdown
-        if "```json" in text:
-            text = text.split("```json")[1].split("```")[0].strip()
-        elif "```" in text:
-            text = text.split("```")[1].split("```")[0].strip()
-            
-        categories = json.loads(text)
-        print(f"DEBUG: AI Categorized {len(emails)} emails successfully.")
-        return categories
+        state = session.get('state')
+        flow = get_flow(state=state)
+        auth_resp = request.url
+        if is_production and auth_resp.startswith('http://'):
+            auth_resp = auth_resp.replace('http://', 'https://', 1)
+        
+        flow.fetch_token(authorization_response=auth_resp)
+        creds = flow.credentials
+        
+        # Save tokens to Firestore for the logged-in user
+        user_id = session.get('user_id')
+        user_info = build('oauth2', 'v2', credentials=creds).userinfo().get().execute()
+        
+        db.collection('users').document(user_id).update({
+            'gmail_connected': True,
+            'gmail_email': user_info.get('email'),
+            'gmail_name': user_info.get('name'),
+            'gmail_picture': user_info.get('picture'),
+            'tokens': {
+                'token': creds.token,
+                'refresh_token': creds.refresh_token,
+                'token_uri': creds.token_uri,
+                'client_id': creds.client_id,
+                'client_secret': creds.client_secret,
+                'scopes': creds.scopes
+            }
+        })
+        return redirect(url_for('index'))
     except Exception as e:
-        print(f"DEBUG: AI Error: {str(e)}")
-        return None
+        return f"Error: {str(e)}", 500
+
+# --- ADMIN ROUTES ---
+
+@app.route('/admin')
+def admin_panel():
+    user_id = session.get('user_id')
+    if user_id != ADMIN_EMAIL:
+        return "Unauthorized", 403
+    
+    users = [u.to_dict() for u in db.collection('users').stream()]
+    return render_template('admin.html', users=users)
 
 @app.route('/api/emails')
 def get_emails():
-    if 'credentials' not in session:
-        return jsonify({"error": "Unauthorized"}), 401
+    user_id = session.get('user_id')
+    if not user_id: return jsonify({"error": "Unauthorized"}), 401
     
-    creds = Credentials(**session['credentials'])
+    user_data = db.collection('users').document(user_id).get().to_dict()
+    if not user_data.get('gmail_connected'): return jsonify({"error": "Gmail not connected"}), 400
+
+    creds_dict = user_data['tokens']
+    creds = Credentials(**creds_dict)
+    
     if creds.expired and creds.refresh_token:
-        try:
-            creds.refresh(Request())
-            session['credentials'] = credentials_to_dict(creds)
-        except:
-            return jsonify({"error": "Auth Refresh Failed"}), 401
+        creds.refresh(Request())
+        db.collection('users').document(user_id).update({'tokens.token': creds.token})
             
     service = build('gmail', 'v1', credentials=creds)
-
     try:
-        # Increase limit to 100 for better robustness
         results = service.users().messages().list(userId='me', maxResults=100).execute()
         messages = results.get('messages', [])
-        
         email_list = []
         for msg in messages:
-            # We use format='metadata' to be faster while getting headers
             m = service.users().messages().get(userId='me', id=msg['id'], format='metadata').execute()
             headers = m.get('payload', {}).get('headers', [])
-            
             email_list.append({
                 "id": msg['id'],
                 "subject": next((h['value'] for h in headers if h['name'] == 'Subject'), '(No Subject)'),
@@ -221,38 +193,32 @@ def get_emails():
                 "url": f"https://mail.google.com/mail/u/0/#inbox/{msg['id']}"
             })
 
-        categorized = {
-            "Primary": [], "Social": [], "Promotions": [], 
-            "Updates": [], "Finance & Bills": [], "Travel": []
-        }
-
-        # Batch process with AI
+        categorized = {"Primary":[], "Social":[], "Promotions":[], "Updates":[], "Finance & Bills":[], "Travel":[]}
         for i in range(0, len(email_list), 20):
             batch = email_list[i:i+20]
-            # Ensure the batch has exactly 20 items for the prompt rules, or handle the remainder
             categories = ai_categorize_batch(batch)
-            
             for j, email in enumerate(batch):
-                cat = "Primary" # Default
-                if categories and j < len(categories):
-                    cat = categories[j].strip()
-                else:
-                    # Robust manual fallback if AI is unavailable
-                    s = (email['from'] + " " + email['subject']).lower()
-                    if any(x in s for x in ['linkedin', 'facebook', 'twitter', 'instagram', 'youtube']): cat = "Social"
-                    elif any(x in s for x in ['invoice', 'receipt', 'bill', 'payment', 'order']): cat = "Finance & Bills"
-                    elif any(x in s for x in ['flight', 'hotel', 'booking', 'itinerary']): cat = "Travel"
-                    elif any(x in s for x in ['newsletter', 'marketing', 'offer', 'sale']): cat = "Promotions"
-                    elif any(x in s for x in ['security', 'alert', 'notice', 'password']): cat = "Updates"
-                
-                # Validation
+                cat = categories[j] if categories and j < len(categories) else "Primary"
                 if cat not in categorized: cat = "Primary"
                 categorized[cat].append(email)
-
         return jsonify(categorized)
     except Exception as e:
-        print(f"ERROR: {str(e)}")
         return jsonify({"error": str(e)}), 500
+
+def ai_categorize_batch(emails):
+    if not GEMINI_API_KEY: return None
+    prompt = "Categorize these emails into Primary, Social, Promotions, Updates, Finance & Bills, Travel. Return ONLY a JSON list of categories."
+    email_data = [f"Sub: {e['subject']} | Snippet: {e['snippet']}" for e in emails]
+    try:
+        response = model.generate_content(prompt + "\n" + json.dumps(email_data))
+        text = response.text.strip().replace('```json', '').replace('```', '')
+        return json.loads(text)
+    except: return None
+
+@app.route('/logout')
+def logout():
+    session.clear()
+    return redirect(url_for('login_page'))
 
 if __name__ == '__main__':
     app.run(port=5000, debug=True)

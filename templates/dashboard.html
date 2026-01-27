@@ -29,16 +29,16 @@
                 
                 <div class="flex items-center gap-4">
                     {% if user %}
+                        {% if is_admin %}
+                            <a href="/admin" class="text-sm font-bold text-indigo-600 hover:underline">Admin Panel</a>
+                        {% endif %}
                         <div class="flex items-center gap-3 pr-4 border-r border-slate-200">
-                            <img src="{{ user.picture }}" class="w-8 h-8 rounded-full border border-slate-200" alt="Avatar">
-                            <span class="text-sm font-medium text-slate-700 hidden sm:block">{{ user.name }}</span>
+                            {% if user.gmail_picture %}
+                                <img src="{{ user.gmail_picture }}" class="w-8 h-8 rounded-full border border-slate-200" alt="Avatar">
+                            {% endif %}
+                            <span class="text-sm font-medium text-slate-700 hidden sm:block">{{ user.email }}</span>
                         </div>
                         <a href="/logout" class="text-sm font-semibold text-slate-600 hover:text-rose-600 transition-colors">Sign Out</a>
-                    {% else %}
-                        <a href="/login" class="bg-indigo-600 hover:bg-indigo-700 text-white px-5 py-2.5 rounded-xl font-semibold text-sm transition-all shadow-lg shadow-indigo-600/20 active:scale-95 flex items-center gap-2">
-                            <svg class="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path d="M12.48 10.92v3.28h7.84c-.24 1.84-.908 3.152-1.928 4.176-1.02 1.024-2.6 2.112-5.912 2.112-5.392 0-9.712-4.376-9.712-9.76s4.32-9.76 9.712-9.76c3.088 0 5.424 1.208 7.088 2.776l2.32-2.32c-1.936-1.856-4.52-3.232-9.408-3.232-8.048 0-14.52 6.472-14.52 14.52s6.472 14.52 14.52 14.52c4.448 0 7.84-1.464 10.432-4.144 2.688-2.688 3.536-6.464 3.536-9.472 0-.896-.08-1.744-.24-2.56h-13.728z"/></svg>
-                            Connect Gmail
-                        </a>
                     {% endif %}
                 </div>
             </div>
@@ -47,47 +47,18 @@
 
     <!-- Main Content -->
     <main class="max-w-5xl mx-auto px-4 py-12">
-        {% if not user %}
-            <!-- Hero Section for Unauthenticated -->
-            <div class="text-center py-20">
-                <h2 class="text-5xl font-extrabold text-slate-900 mb-6 tracking-tight leading-tight">
-                    Your Inbox, <span class="text-indigo-600">Smartly Organized.</span>
-                </h2>
-                <p class="text-lg text-slate-600 mb-10 max-w-2xl mx-auto leading-relaxed">
-                    Automatically categorize your Gmail messages into clear groups. No more clutter, no more noise. Just the emails that matter, when they matter.
-                </p>
-                <div class="flex justify-center gap-4">
-                    <a href="/login" class="px-8 py-4 bg-indigo-600 text-white rounded-2xl font-bold text-lg hover:bg-indigo-700 transition-all shadow-xl shadow-indigo-600/30">
-                        Get Started for Free
+        {% if user %}
+            {% if not user.gmail_connected %}
+                <div class="text-center py-20 bg-white rounded-3xl border border-dashed border-slate-300">
+                    <h2 class="text-2xl font-bold text-slate-900 mb-4">One Last Step!</h2>
+                    <p class="text-slate-500 mb-8">Connect your Gmail account to start seeing categorized emails.</p>
+                    <a href="/connect-gmail" class="bg-indigo-600 text-white px-8 py-4 rounded-2xl font-bold hover:bg-indigo-700 transition-all">
+                        Connect My Gmail
                     </a>
                 </div>
-                <div class="mt-16 grid grid-cols-1 sm:grid-cols-3 gap-8 text-left">
-                    <div class="bg-white p-6 rounded-2xl border border-slate-100">
-                        <div class="w-10 h-10 bg-indigo-100 text-indigo-600 rounded-lg flex items-center justify-center mb-4">
-                            <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M13 10V3L4 14h7v7l9-11h-7z"/></svg>
-                        </div>
-                        <h3 class="font-bold text-slate-900 mb-2">Instant Fetching</h3>
-                        <p class="text-slate-500 text-sm">We securely connect to your Gmail to pull your latest messages in seconds.</p>
-                    </div>
-                    <div class="bg-white p-6 rounded-2xl border border-slate-100">
-                        <div class="w-10 h-10 bg-emerald-100 text-emerald-600 rounded-lg flex items-center justify-center mb-4">
-                            <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"/></svg>
-                        </div>
-                        <h3 class="font-bold text-slate-900 mb-2">Private & Secure</h3>
-                        <p class="text-slate-500 text-sm">Your data is never stored on our servers. We only read it with your permission.</p>
-                    </div>
-                    <div class="bg-white p-6 rounded-2xl border border-slate-100">
-                        <div class="w-10 h-10 bg-violet-100 text-violet-600 rounded-lg flex items-center justify-center mb-4">
-                            <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M19.428 15.428a2 2 0 00-1.022-.547l-2.387-.477a6 6 0 00-3.86.517l-.694.347a2 2 0 00-1.058 1.058l-.347.694a6 6 0 00-.517 3.86l.477 2.387a2 2 0 00.547 1.022l1.428 1.428a2 2 0 002.828 0l6.414-6.414a2 2 0 000-2.828l-1.428-1.428z"/></svg>
-                        </div>
-                        <h3 class="font-bold text-slate-900 mb-2">Smart Sorting</h3>
-                        <p class="text-slate-500 text-sm">Context-aware categorization sorts Social, Finance, and Updates automatically.</p>
-                    </div>
-                </div>
-            </div>
-        {% else %}
-            <!-- Dashboard for Authenticated -->
-            <div id="loadingState" class="flex flex-col items-center justify-center py-20">
+            {% else %}
+                <!-- Dashboard for Authenticated -->
+                <div id="loadingState" class="flex flex-col items-center justify-center py-20">
                 <div class="loader ease-linear rounded-full border-4 border-t-4 border-gray-200 h-16 w-16 mb-4"></div>
                 <h3 class="text-xl font-semibold text-slate-700">Analyzing your inbox...</h3>
                 <p class="text-slate-500">This usually takes a few seconds.</p>
