@@ -41,8 +41,6 @@ def get_google_config():
             with open(client_secrets_file, 'r') as f:
                 config = json.load(f)
     
-    if config and 'web' in config:
-        return config['web']
     return config
 
 def get_flow(state=None):
