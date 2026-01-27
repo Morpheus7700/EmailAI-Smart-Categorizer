@@ -151,32 +151,39 @@ if GEMINI_API_KEY:
 def ai_categorize_batch(emails):
     """Uses Gemini to categorize a batch of emails based on context."""
     if not GEMINI_API_KEY:
-        return None # Fallback to manual
+        print("DEBUG: No GEMINI_API_KEY found. Using manual fallback.")
+        return None
     
     prompt = """
-    Categorize the following emails into exactly one of these categories: 
-    'Primary', 'Social', 'Promotions', 'Updates', 'Finance & Bills', 'Travel'.
-    
-    Context Rules:
-    - 'Finance & Bills': Invoices, receipts, bank alerts, salary, or payment confirmations.
-    - 'Social': Notifications from LinkedIn, Facebook, Twitter, etc.
-    - 'Travel': Flight bookings, hotel stays, or trip itineraries.
-    - 'Promotions': Marketing, newsletters, or sales offers.
-    - 'Updates': Security alerts, system notifications, or status updates.
-    - 'Primary': Personal conversations or important direct work emails.
+    You are an expert email organizer. Categorize these 20 emails into EXACTLY one of these buckets:
+    - 'Primary': Personal 1-to-1 emails, direct work communications, or important human-sent messages.
+    - 'Social': Notifications from LinkedIn, Facebook, Twitter, Instagram, YouTube, or dating apps.
+    - 'Promotions': Marketing emails, newsletters, sales, discounts, or coupons.
+    - 'Updates': Automated alerts, security notices, password resets, shipping updates, or service announcements.
+    - 'Finance & Bills': Bank statements, invoices, receipts, payment confirmations, or salary slips.
+    - 'Travel': Flight tickets, hotel bookings, car rentals, or trip itineraries.
 
-    Return the result as a JSON array of strings in the same order as the emails provided.
-    Only return the JSON array, nothing else.
+    Rules:
+    1. Be aggressive. If it looks like a newsletter, it's 'Promotions'. If it's a notification from a service, it's 'Updates'.
+    2. Respond ONLY with a valid JSON list of strings (e.g., ["Primary", "Social", ...]).
+    3. The list MUST have exactly 20 items in the same order as the input.
     """
     
-    email_data = [f"Sub: {e['subject']} | Snippet: {e['snippet']}" for e in emails]
+    email_data = [f"From: {e['from']} | Sub: {e['subject']} | Snippet: {e['snippet']}" for e in emails]
     try:
-        response = model.generate_content(prompt + "\n" + json.dumps(email_data))
-        # Extract JSON from response (handling potential markdown formatting)
-        clean_response = response.text.strip().replace('```json', '').replace('```', '')
-        return json.loads(clean_response)
+        response = model.generate_content(prompt + "\n\nEmails to categorize:\n" + json.dumps(email_data))
+        text = response.text.strip()
+        # Clean up Markdown
+        if "```json" in text:
+            text = text.split("```json")[1].split("```")[0].strip()
+        elif "```" in text:
+            text = text.split("```")[1].split("```")[0].strip()
+            
+        categories = json.loads(text)
+        print(f"DEBUG: AI Categorized {len(emails)} emails successfully.")
+        return categories
     except Exception as e:
-        print(f"AI Error: {e}")
+        print(f"DEBUG: AI Error: {str(e)}")
         return None
 
 @app.route('/api/emails')
@@ -195,15 +202,15 @@ def get_emails():
     service = build('gmail', 'v1', credentials=creds)
 
     try:
-        # Increased to 100 emails
+        # Increase limit to 100 for better robustness
         results = service.users().messages().list(userId='me', maxResults=100).execute()
         messages = results.get('messages', [])
         
         email_list = []
         for msg in messages:
-            m = service.users().messages().get(userId='me', id=msg['id'], format='full').execute()
-            payload = m.get('payload', {})
-            headers = payload.get('headers', [])
+            # We use format='metadata' to be faster while getting headers
+            m = service.users().messages().get(userId='me', id=msg['id'], format='metadata').execute()
+            headers = m.get('payload', {}).get('headers', [])
             
             email_list.append({
                 "id": msg['id'],
@@ -214,33 +221,37 @@ def get_emails():
                 "url": f"https://mail.google.com/mail/u/0/#inbox/{msg['id']}"
             })
 
-        # Smart Categorization
         categorized = {
             "Primary": [], "Social": [], "Promotions": [], 
             "Updates": [], "Finance & Bills": [], "Travel": []
         }
 
-        # Batch process with AI in chunks of 20 to avoid prompt limits
+        # Batch process with AI
         for i in range(0, len(email_list), 20):
             batch = email_list[i:i+20]
+            # Ensure the batch has exactly 20 items for the prompt rules, or handle the remainder
             categories = ai_categorize_batch(batch)
             
             for j, email in enumerate(batch):
                 cat = "Primary" # Default
                 if categories and j < len(categories):
-                    cat = categories[j]
+                    cat = categories[j].strip()
                 else:
-                    # Fallback keyword logic if AI fails
-                    sender_l = email['from'].lower()
-                    subj_l = email['subject'].lower()
-                    if any(x in sender_l for x in ['facebook', 'linkedin', 'instagram']): cat = "Social"
-                    elif any(x in subj_l for x in ['invoice', 'bill', 'receipt']): cat = "Finance & Bills"
+                    # Robust manual fallback if AI is unavailable
+                    s = (email['from'] + " " + email['subject']).lower()
+                    if any(x in s for x in ['linkedin', 'facebook', 'twitter', 'instagram', 'youtube']): cat = "Social"
+                    elif any(x in s for x in ['invoice', 'receipt', 'bill', 'payment', 'order']): cat = "Finance & Bills"
+                    elif any(x in s for x in ['flight', 'hotel', 'booking', 'itinerary']): cat = "Travel"
+                    elif any(x in s for x in ['newsletter', 'marketing', 'offer', 'sale']): cat = "Promotions"
+                    elif any(x in s for x in ['security', 'alert', 'notice', 'password']): cat = "Updates"
                 
+                # Validation
                 if cat not in categorized: cat = "Primary"
                 categorized[cat].append(email)
 
         return jsonify(categorized)
     except Exception as e:
+        print(f"ERROR: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
