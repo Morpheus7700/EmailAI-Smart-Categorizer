@@ -229,59 +229,95 @@ def get_emails():
                 "url": f"https://mail.google.com/mail/u/0/#inbox/{msg['id']}"
             })
 
-        categorized = {"Primary":[], "Social":[], "Promotions":[], "Updates":[], "Finance & Bills":[], "Travel":[]}
-        batch_size = 10  # Reduced batch size for better accuracy
+        categorized_lists = {"Primary":[], "Social":[], "Promotions":[], "Updates":[], "Finance & Bills":[], "Travel":[]}
+        
+        # Normalization mapping
+        CAT_MAP = {
+            "primary": "Primary",
+            "social": "Social",
+            "promotions": "Promotions",
+            "promo": "Promotions",
+            "updates": "Updates",
+            "update": "Updates",
+            "finance & bills": "Finance & Bills",
+            "finance": "Finance & Bills",
+            "bills": "Finance & Bills",
+            "travel": "Travel"
+        }
+        
+        batch_size = 10
         for i in range(0, len(email_list), batch_size):
             batch = email_list[i:i+batch_size]
-            app.logger.info(f"Processing batch {i//batch_size + 1} ({len(batch)} emails)")
+            app.logger.info(f"--- START BATCH {i//batch_size + 1} ---")
             categories = ai_categorize_batch(batch)
             
-            if not categories:
-                app.logger.warning(f"Batch {i//batch_size + 1} failed integration, defaulting to Primary")
+            if not categories or not isinstance(categories, list):
+                app.logger.error(f"Batch {i//batch_size + 1} returned NO CATEGORIES. Defaulting to Primary.")
+                categories = ["Primary"] * len(batch)
             
             for j, email in enumerate(batch):
-                cat = categories[j] if categories and j < len(categories) else "Primary"
-                if cat not in categorized:
-                    app.logger.warning(f"Unknown category returned: {cat}")
-                    cat = "Primary"
-                categorized[cat].append(email)
+                raw_cat = categories[j] if j < len(categories) else "Primary"
+                # Normalize the category name
+                normalized_cat = CAT_MAP.get(str(raw_cat).lower().strip(), "Primary")
+                
+                if normalized_cat not in categorized_lists:
+                    normalized_cat = "Primary"
+                
+                categorized_lists[normalized_cat].append(email)
+                app.logger.info(f"Email: {email['subject'][:30]}... -> Raw: {raw_cat} -> Normalized: {normalized_cat}")
         
-        counts = {k: len(v) for k, v in categorized.items()}
-        app.logger.info(f"Categorization complete: {counts}")
-        return jsonify(categorized)
+        final_counts = {k: len(v) for k, v in categorized_lists.items()}
+        app.logger.info(f"FINAL CATEGORIZATION: {final_counts}")
+        return jsonify(categorized_lists)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 def ai_categorize_batch(emails):
     if not GEMINI_API_KEY: 
-        app.logger.error("GEMINI_API_KEY is missing")
+        app.logger.error("GEMINI_API_KEY is missing from environment")
         return None
     
-    # Few-shot examples to ground the model
-    few_shot_context = """Here are examples of correct categorization:
-1. From: "LinkedIn" <notifications-noreply@linkedin.com> | Sub: "You have a new connection" -> Social
-2. From: "Amazon.com" <shipment-tracking@amazon.com> | Sub: "Your package has shipped!" -> Updates
-3. From: "Chase Bank" <no-reply@chase.com> | Sub: "Your monthly statement is ready" -> Finance & Bills
-4. From: "Nike" <nike@official.nike.com> | Sub: "50% off sitewide - limited time only" -> Promotions
-5. From: "Expedia" <confirmations@expedia.com> | Sub: "Hotel booking confirmed: Paris" -> Travel
-6. From: "Mom" <mom123@gmail.com> | Sub: "Coming for dinner tonight?" -> Primary\n\n"""
+    # Strictly defined categories
+    prompt_header = """SYSTEM INSTRUCTION: You are a strict email filter. YOU MUST NOT USE 'Primary' for any email that fits another category. Be aggressive in sorting into Social, Promotions, Updates, Finance & Bills, or Travel.
 
-    prompt = f"Categorize these {len(emails)} emails. Return ONLY a JSON list of strings.\n\nEmails:\n"
-    email_data = [f"From: {e['from']} | List-ID: {e.get('list_id')} | Sub: {e['subject']} | Snippet: {e['snippet']}" for e in emails]
+Categories:
+- Social: LinkedIn, Facebook, Twitter, social networks, community updates.
+- Promotions: Discounts, sales, newsletters, brand marketing.
+- Updates: Shipping, order confirmations, login alerts, system notifications.
+- Finance & Bills: Bank alerts, receipts, invoices, statements.
+- Travel: Flights, hotels, bookings.
+- Primary: ONLY for personal 1-to-1 emails from actual people.
+
+Return ONLY a JSON list of strings (e.g., ["Promotions", "Social"])."""
+
+    email_data = [f"From: {e['from']} | Sub: {e['subject']} | Snippet: {e['snippet'][:100]}" for e in emails]
+    full_prompt = f"{prompt_header}\n\nEmails to categorize:\n{json.dumps(email_data)}"
     
     try:
+        app.logger.info(f"Sending {len(emails)} emails to Gemini...")
         response = model.generate_content(
-            few_shot_context + prompt + json.dumps(email_data),
+            full_prompt,
             generation_config={"response_mime_type": "application/json"}
         )
-        categories = json.loads(response.text.strip())
-        if isinstance(categories, list) and len(categories) == len(emails):
-            return categories
         
-        app.logger.warning(f"AI returned invalid list length: {len(categories)} vs {len(emails)}")
+        response_text = response.text.strip()
+        app.logger.info(f"Gemini Response: {response_text}")
+        
+        # Robust parsing
+        try:
+            # Try to find the JSON array if there's extra text
+            start = response_text.find('[')
+            end = response_text.rfind(']') + 1
+            if start != -1 and end != -1:
+                categories = json.loads(response_text[start:end])
+                if isinstance(categories, list):
+                    return categories
+        except Exception as parse_err:
+            app.logger.error(f"JSON Parse Error: {str(parse_err)}")
+            
         return None
     except Exception as e:
-        app.logger.error(f"AI Categorization error: {str(e)}")
+        app.logger.error(f"Gemini API Error: {str(e)}")
         return None
 
 @app.route('/logout')
