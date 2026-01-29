@@ -226,13 +226,40 @@ def get_emails():
 
 def ai_categorize_batch(emails):
     if not GEMINI_API_KEY: return None
-    prompt = "Categorize these emails into Primary, Social, Promotions, Updates, Finance & Bills, Travel. Return ONLY a JSON list of categories."
-    email_data = [f"Sub: {e['subject']} | Snippet: {e['snippet']}" for e in emails]
+    
+    prompt = """Categorize these emails into EXACTLY one of these categories: 
+- Primary: Personal conversations and important 1-to-1 emails.
+- Social: Messages from social networks and media sharing sites.
+- Promotions: Marketing, newsletters, and sales emails.
+- Updates: Auto-generated notifications like shipping, receipts, or security alerts.
+- Finance & Bills: Bank statements, invoices, and bill reminders.
+- Travel: Flight confirmations, hotel bookings, and itineraries.
+
+Return ONLY a valid JSON list of strings, e.g., ["Primary", "Social", ...].
+Number of items in the output list MUST match the number of input emails.
+If unsure, use 'Primary'.
+
+Emails:"""
+    
+    email_data = [f"From: {e['from']} | Sub: {e['subject']} | Snippet: {e['snippet']}" for e in emails]
+    
     try:
         response = model.generate_content(prompt + "\n" + json.dumps(email_data))
         text = response.text.strip().replace('```json', '').replace('```', '')
-        return json.loads(text)
-    except: return None
+        
+        # Clean up possible leading/trailing non-JSON text
+        start = text.find('[')
+        end = text.rfind(']') + 1
+        if start != -1 and end != -1:
+            categories = json.loads(text[start:end])
+            if isinstance(categories, list):
+                return categories
+        
+        app.logger.warning(f"AI response parsing failed: {text}")
+        return None
+    except Exception as e:
+        app.logger.error(f"AI Categorization error: {str(e)}")
+        return None
 
 @app.route('/logout')
 def logout():
