@@ -213,21 +213,34 @@ def get_emails():
             })
 
         categorized = {"Primary":[], "Social":[], "Promotions":[], "Updates":[], "Finance & Bills":[], "Travel":[]}
-        for i in range(0, len(email_list), 20):
-            batch = email_list[i:i+20]
+        batch_size = 10  # Reduced batch size for better accuracy
+        for i in range(0, len(email_list), batch_size):
+            batch = email_list[i:i+batch_size]
+            app.logger.info(f"Processing batch {i//batch_size + 1} ({len(batch)} emails)")
             categories = ai_categorize_batch(batch)
+            
+            if not categories:
+                app.logger.warning(f"Batch {i//batch_size + 1} failed integration, defaulting to Primary")
+            
             for j, email in enumerate(batch):
                 cat = categories[j] if categories and j < len(categories) else "Primary"
-                if cat not in categorized: cat = "Primary"
+                if cat not in categorized:
+                    app.logger.warning(f"Unknown category returned: {cat}")
+                    cat = "Primary"
                 categorized[cat].append(email)
+        
+        counts = {k: len(v) for k, v in categorized.items()}
+        app.logger.info(f"Categorization complete: {counts}")
         return jsonify(categorized)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 def ai_categorize_batch(emails):
-    if not GEMINI_API_KEY: return None
+    if not GEMINI_API_KEY: 
+        app.logger.error("GEMINI_API_KEY is missing")
+        return None
     
-    prompt = """Categorize these emails into EXACTLY one of these categories: 
+    prompt = f"""Categorize these {len(emails)} emails into EXACTLY one of these categories: 
 - Primary: Personal conversations and important 1-to-1 emails.
 - Social: Messages from social networks and media sharing sites.
 - Promotions: Marketing, newsletters, and sales emails.
@@ -235,30 +248,43 @@ def ai_categorize_batch(emails):
 - Finance & Bills: Bank statements, invoices, and bill reminders.
 - Travel: Flight confirmations, hotel bookings, and itineraries.
 
-Return ONLY a valid JSON list of strings, e.g., ["Primary", "Social", ...].
-Number of items in the output list MUST match the number of input emails.
-If unsure, use 'Primary'.
+Input: A list of emails.
+Output: Return ONLY a JSON list of {len(emails)} strings. No extra text.
+Example: ["Primary", "Social", "Promotions"]
 
-Emails:"""
+Emails to categorize:"""
     
-    email_data = [f"From: {e['from']} | Sub: {e['subject']} | Snippet: {e['snippet']}" for e in emails]
+    email_data = [f"Idx: {idx} | From: {e['from']} | Sub: {e['subject']}" for idx, e in enumerate(emails)]
     
     try:
-        response = model.generate_content(prompt + "\n" + json.dumps(email_data))
-        text = response.text.strip().replace('```json', '').replace('```', '')
+        # Requesting JSON response specifically
+        response = model.generate_content(
+            prompt + "\n" + json.dumps(email_data),
+            generation_config={"response_mime_type": "application/json"}
+        )
+        text = response.text.strip()
+        app.logger.info(f"AI Raw Response: {text}")
         
-        # Clean up possible leading/trailing non-JSON text
-        start = text.find('[')
-        end = text.rfind(']') + 1
-        if start != -1 and end != -1:
-            categories = json.loads(text[start:end])
-            if isinstance(categories, list):
-                return categories
+        categories = json.loads(text)
+        if isinstance(categories, list):
+            # Ensure we match the input length
+            if len(categories) != len(emails):
+                app.logger.warning(f"AI returned {len(categories)} categories for {len(emails)} emails")
+            return categories
         
-        app.logger.warning(f"AI response parsing failed: {text}")
         return None
     except Exception as e:
         app.logger.error(f"AI Categorization error: {str(e)}")
+        # Fallback to manual parsing if MIME type isn't supported or fails
+        try:
+            response = model.generate_content(prompt + "\n" + json.dumps(email_data))
+            text = response.text.strip().replace('```json', '').replace('```', '')
+            start = text.find('[')
+            end = text.rfind(']') + 1
+            if start != -1 and end != -1:
+                return json.loads(text[start:end])
+        except:
+            pass
         return None
 
 @app.route('/logout')
