@@ -38,7 +38,23 @@ else:
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel('gemini-1.5-flash')
+    
+    # System Instruction for the model
+    system_instruction = """You are an expert email triaging assistant. 
+Your goal is to categorize emails into EXACTLY one of the following buckets based on their headers and content:
+- Primary: Personal 1-to-1 conversations, important personal notifications, or manually sent emails.
+- Social: Notifications from social media, dating apps, or community forums.
+- Promotions: Marketing emails, newsletters, coupons, and brand announcements.
+- Updates: Automated system notifications, shipping alerts, order confirmations, login alerts, or security updates.
+- Finance & Bills: Bank statements, invoices, bill reminders, and payment receipts.
+- Travel: Flight tickets, hotel bookings, car rentals, and trip itineraries.
+
+You must be precise and avoid defaulting to 'Primary' unless the email is clearly a personal communication."""
+    
+    model = genai.GenerativeModel(
+        model_name='gemini-1.5-flash',
+        system_instruction=system_instruction
+    )
 
 SCOPES = ['https://www.googleapis.com/auth/gmail.readonly', 'https://www.googleapis.com/auth/userinfo.profile', 'openid']
 
@@ -207,6 +223,7 @@ def get_emails():
                 "id": msg['id'],
                 "subject": next((h['value'] for h in headers if h['name'] == 'Subject'), '(No Subject)'),
                 "from": next((h['value'] for h in headers if h['name'] == 'From'), 'Unknown'),
+                "list_id": next((h['value'] for h in headers if h['name'] == 'List-ID'), None),
                 "snippet": m.get('snippet', ''),
                 "date": next((h['value'] for h in headers if h['name'] == 'Date'), ''),
                 "url": f"https://mail.google.com/mail/u/0/#inbox/{msg['id']}"
@@ -240,51 +257,31 @@ def ai_categorize_batch(emails):
         app.logger.error("GEMINI_API_KEY is missing")
         return None
     
-    prompt = f"""Categorize these {len(emails)} emails into EXACTLY one of these categories: 
-- Primary: Personal conversations and important 1-to-1 emails.
-- Social: Messages from social networks and media sharing sites.
-- Promotions: Marketing, newsletters, and sales emails.
-- Updates: Auto-generated notifications like shipping, receipts, or security alerts.
-- Finance & Bills: Bank statements, invoices, and bill reminders.
-- Travel: Flight confirmations, hotel bookings, and itineraries.
+    # Few-shot examples to ground the model
+    few_shot_context = """Here are examples of correct categorization:
+1. From: "LinkedIn" <notifications-noreply@linkedin.com> | Sub: "You have a new connection" -> Social
+2. From: "Amazon.com" <shipment-tracking@amazon.com> | Sub: "Your package has shipped!" -> Updates
+3. From: "Chase Bank" <no-reply@chase.com> | Sub: "Your monthly statement is ready" -> Finance & Bills
+4. From: "Nike" <nike@official.nike.com> | Sub: "50% off sitewide - limited time only" -> Promotions
+5. From: "Expedia" <confirmations@expedia.com> | Sub: "Hotel booking confirmed: Paris" -> Travel
+6. From: "Mom" <mom123@gmail.com> | Sub: "Coming for dinner tonight?" -> Primary\n\n"""
 
-Input: A list of emails.
-Output: Return ONLY a JSON list of {len(emails)} strings. No extra text.
-Example: ["Primary", "Social", "Promotions"]
-
-Emails to categorize:"""
-    
-    email_data = [f"Idx: {idx} | From: {e['from']} | Sub: {e['subject']}" for idx, e in enumerate(emails)]
+    prompt = f"Categorize these {len(emails)} emails. Return ONLY a JSON list of strings.\n\nEmails:\n"
+    email_data = [f"From: {e['from']} | List-ID: {e.get('list_id')} | Sub: {e['subject']} | Snippet: {e['snippet']}" for e in emails]
     
     try:
-        # Requesting JSON response specifically
         response = model.generate_content(
-            prompt + "\n" + json.dumps(email_data),
+            few_shot_context + prompt + json.dumps(email_data),
             generation_config={"response_mime_type": "application/json"}
         )
-        text = response.text.strip()
-        app.logger.info(f"AI Raw Response: {text}")
-        
-        categories = json.loads(text)
-        if isinstance(categories, list):
-            # Ensure we match the input length
-            if len(categories) != len(emails):
-                app.logger.warning(f"AI returned {len(categories)} categories for {len(emails)} emails")
+        categories = json.loads(response.text.strip())
+        if isinstance(categories, list) and len(categories) == len(emails):
             return categories
         
+        app.logger.warning(f"AI returned invalid list length: {len(categories)} vs {len(emails)}")
         return None
     except Exception as e:
         app.logger.error(f"AI Categorization error: {str(e)}")
-        # Fallback to manual parsing if MIME type isn't supported or fails
-        try:
-            response = model.generate_content(prompt + "\n" + json.dumps(email_data))
-            text = response.text.strip().replace('```json', '').replace('```', '')
-            start = text.find('[')
-            end = text.rfind(']') + 1
-            if start != -1 and end != -1:
-                return json.loads(text[start:end])
-        except:
-            pass
         return None
 
 @app.route('/logout')
