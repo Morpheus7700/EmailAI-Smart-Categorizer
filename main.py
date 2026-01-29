@@ -23,7 +23,13 @@ db = firestore.Client()
 # Production / Proxy Configuration
 is_production = os.environ.get('K_SERVICE') or os.environ.get('VERCEL_URL')
 if is_production:
-    app.config.update(SESSION_COOKIE_SECURE=True, SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE='Lax')
+    # Optimized for Cloud Run and other production environments behind proxies
+    app.config.update(
+        SESSION_COOKIE_SECURE=True,
+        SESSION_COOKIE_HTTPONLY=True,
+        SESSION_COOKIE_SAMESITE='Lax',
+        PREFERRED_URL_SCHEME='https'
+    )
     os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = '0'
 else:
     os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = '1'
@@ -62,48 +68,61 @@ def get_flow(state=None):
 
 @app.route('/')
 def index():
-    user_id = session.get('user_id')
-    if not user_id:
-        return render_template('login.html')
-    
-    user_doc = db.collection('users').document(user_id).get()
-    if not user_doc.exists:
-        session.clear()
-        return redirect(url_for('login_page'))
-    
-    user_data = user_doc.to_dict()
-    return render_template('dashboard.html', user=user_data, is_admin=(user_data.get('email') == ADMIN_EMAIL))
+    try:
+        user_id = session.get('user_id')
+        if not user_id:
+            return render_template('login.html')
+        
+        user_doc = db.collection('users').document(user_id).get()
+        if not user_doc.exists:
+            session.clear()
+            return redirect(url_for('login_page'))
+        
+        user_data = user_doc.to_dict()
+        return render_template('dashboard.html', user=user_data, is_admin=(user_data.get('email') == ADMIN_EMAIL))
+    except Exception as e:
+        app.logger.error(f"Index error: {str(e)}")
+        return f"System Error: {str(e)}. Please check if Firestore is enabled and service account has permissions.", 500
 
 @app.route('/signup', methods=['GET', 'POST'])
 def signup():
     if request.method == 'POST':
-        email = request.form.get('email')
-        password = request.form.get('password')
-        
-        user_ref = db.collection('users').document(email)
-        if user_ref.get().exists:
-            return "User already exists", 400
-        
-        user_ref.set({
-            'email': email,
-            'password': generate_password_hash(password),
-            'gmail_connected': False
-        })
-        session['user_id'] = email
-        return redirect(url_for('index'))
+        try:
+            email = request.form.get('email')
+            password = request.form.get('password')
+            
+            user_ref = db.collection('users').document(email)
+            if user_ref.get().exists:
+                return "User already exists", 400
+            
+            user_ref.set({
+                'email': email,
+                'password': generate_password_hash(password),
+                'gmail_connected': False
+            })
+            session['user_id'] = email
+            return redirect(url_for('index', _external=True, _scheme='https' if is_production else 'http'))
+        except Exception as e:
+            app.logger.error(f"Signup error: {str(e)}")
+            return f"Signup Error: {str(e)}. Check Firestore/Environment variables.", 500
     return render_template('signup.html')
 
 @app.route('/login', methods=['GET', 'POST'])
 def login_page():
     if request.method == 'POST':
-        email = request.form.get('email')
-        password = request.form.get('password')
-        
-        user_doc = db.collection('users').document(email).get()
-        if user_doc.exists and check_password_hash(user_doc.to_dict()['password'], password):
-            session['user_id'] = email
-            return redirect(url_for('index'))
-        return "Invalid credentials", 401
+        try:
+            email = request.form.get('email')
+            password = request.form.get('password')
+            
+            user_doc = db.collection('users').document(email).get()
+            if user_doc.exists and check_password_hash(user_doc.to_dict()['password'], password):
+                session['user_id'] = email
+                # Use a specific redirect to avoid relative path issues in some proxies
+                return redirect(url_for('index', _external=True, _scheme='https' if is_production else 'http'))
+            return "Invalid credentials", 401
+        except Exception as e:
+            app.logger.error(f"Login error: {str(e)}")
+            return f"Login Error: {str(e)}. Check Firestore/Environment variables.", 500
     return render_template('login.html')
 
 # --- GMAIL OAUTH ROUTES ---
