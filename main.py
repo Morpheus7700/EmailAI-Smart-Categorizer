@@ -34,6 +34,9 @@ if is_production:
 else:
     os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = '1'
 
+# Audit Log for AI (Last 5 batches)
+ai_audit_logs = []
+
 # Gemini Setup
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
 if GEMINI_API_KEY:
@@ -41,19 +44,29 @@ if GEMINI_API_KEY:
     
     # System Instruction for the model
     system_instruction = """You are an expert email triaging assistant. 
-Your goal is to categorize emails into EXACTLY one of the following buckets based on their headers and content:
-- Primary: Personal 1-to-1 conversations, important personal notifications, or manually sent emails.
-- Social: Notifications from social media, dating apps, or community forums.
-- Promotions: Marketing emails, newsletters, coupons, and brand announcements.
-- Updates: Automated system notifications, shipping alerts, order confirmations, login alerts, or security updates.
-- Finance & Bills: Bank statements, invoices, bill reminders, and payment receipts.
-- Travel: Flight tickets, hotel bookings, car rentals, and trip itineraries.
-
-You must be precise and avoid defaulting to 'Primary' unless the email is clearly a personal communication."""
+Categorize emails into Social, Promotions, Updates, Finance & Bills, Travel, or Primary.
+CRITICAL: Only use 'Primary' for human-to-human personal emails. Be aggressive with other categories."""
     
     model = genai.GenerativeModel(
         model_name='gemini-1.5-flash',
-        system_instruction=system_instruction
+        system_instruction=system_instruction,
+        generation_config={
+            "response_mime_type": "application/json",
+            "response_schema": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "category": {
+                            "type": "string",
+                            "enum": ["Primary", "Social", "Promotions", "Updates", "Finance & Bills", "Travel"]
+                        },
+                        "reasoning": {"type": "string"}
+                    },
+                    "required": ["category", "reasoning"]
+                }
+            }
+        }
     )
 
 SCOPES = ['https://www.googleapis.com/auth/gmail.readonly', 'https://www.googleapis.com/auth/userinfo.profile', 'openid']
@@ -207,6 +220,11 @@ def api_status():
     }
     return jsonify(status)
 
+@app.route('/api/logs')
+def get_ai_logs():
+    """Returns the last few AI audit logs."""
+    return jsonify(ai_audit_logs)
+
 @app.route('/api/emails')
 def get_emails():
     user_id = session.get('user_id')
@@ -256,26 +274,25 @@ def get_emails():
             "travel": "Travel"
         }
         
-        batch_size = 10
+        batch_size = 5 # Small batch for max accuracy
         for i in range(0, len(email_list), batch_size):
             batch = email_list[i:i+batch_size]
             app.logger.info(f"--- START BATCH {i//batch_size + 1} ---")
-            categories = ai_categorize_batch(batch)
-            
-            if not categories or not isinstance(categories, list):
-                app.logger.error(f"Batch {i//batch_size + 1} returned NO CATEGORIES. Defaulting to Primary.")
-                categories = ["Primary"] * len(batch)
+            results = ai_categorize_batch(batch)
             
             for j, email in enumerate(batch):
-                raw_cat = categories[j] if j < len(categories) else "Primary"
-                # Normalize the category name
-                normalized_cat = CAT_MAP.get(str(raw_cat).lower().strip(), "Primary")
+                # Fallback logic
+                res = results[j] if results and j < len(results) else {"category": "Primary", "reasoning": "Fallback"}
+                cat = res.get('category', 'Primary')
                 
+                # Double check normalization
+                normalized_cat = CAT_MAP.get(cat.lower().strip(), "Primary")
                 if normalized_cat not in categorized_lists:
                     normalized_cat = "Primary"
                 
+                email['reasoning'] = res.get('reasoning', '')
                 categorized_lists[normalized_cat].append(email)
-                app.logger.info(f"Email: {email['subject'][:30]}... -> Raw: {raw_cat} -> Normalized: {normalized_cat}")
+                app.logger.info(f"Email: {email['subject'][:30]}... -> Cat: {cat} -> Reason: {res.get('reasoning')}")
         
         final_counts = {k: len(v) for k, v in categorized_lists.items()}
         app.logger.info(f"FINAL CATEGORIZATION: {final_counts}")
@@ -284,51 +301,34 @@ def get_emails():
         return jsonify({"error": str(e)}), 500
 
 def ai_categorize_batch(emails):
-    if not GEMINI_API_KEY: 
-        app.logger.error("DIAGNOSTIC: GEMINI_API_KEY is missing from environment variables.")
-        return None
+    if not GEMINI_API_KEY: return None
     
-    # Strictly defined categories with strong semantic hints
-    prompt_header = """SYSTEM INSTRUCTION:
-You are an advanced email classifier. You MUST categorize each email into EXACTLY ONE of the following:
-- Social: From Social Networks (LinkedIn, FB, IG), dating apps, or forums.
-- Promotions: Marketing, newsletters, sales, offers, brand announcements.
-- Updates: Automated system alerts, shipping, order confirmations, security alerts, login notifications.
-- Finance & Bills: Bank statements, invoices, bill reminders, payment receipts.
-- Travel: Flights, hotels, itineraries, car rentals.
-- Primary: ONLY for 1-to-1 personal conversations between humans.
-
-CRITICAL RULE: NEVER default to 'Primary' if there is ANY signal for another category. Be aggressive.
-Output: A JSON list of strings only. No explanation."""
-
-    # Structured data provides much stronger signals than a single string
     structured_data = []
     for e in emails:
         structured_data.append({
             "from": e.get('from'),
             "subject": e.get('subject'),
-            "list_id": e.get('list_id'),
-            "snippet": e.get('snippet', '')[:120]
+            "snippet": e.get('snippet', '')[:100]
         })
 
     try:
-        app.logger.info(f"FORENSIC: Sending {len(emails)} emails to Gemini with structured data.")
-        # We use a very direct prompt to ensure the model focuses on the schema
-        response = model.generate_content(
-            f"{prompt_header}\n\nDATA TO CATEGORIZE:\n{json.dumps(structured_data)}",
-            generation_config={"response_mime_type": "application/json"}
-        )
+        # The model already has the response_schema and system_instruction 
+        # from our previous edit to its initialization.
+        response = model.generate_content(json.dumps(structured_data))
+        results = json.loads(response.text.strip())
         
-        response_text = response.text.strip()
-        app.logger.info(f"FORENSIC: Gemini Raw Response: {response_text}")
+        # Save to global audit log for the /api/logs route
+        global ai_audit_logs
+        ai_audit_logs.insert(0, {
+            "timestamp": "Latest Batch",
+            "input": structured_data,
+            "output": results
+        })
+        ai_audit_logs = ai_audit_logs[:5] 
         
-        categories = json.loads(response_text)
-        if isinstance(categories, list):
-            return categories
-            
-        return None
+        return results
     except Exception as e:
-        app.logger.error(f"FORENSIC: Gemini API/Parse Error: {str(e)}")
+        app.logger.error(f"GEMINI ERROR: {str(e)}")
         return None
 
 @app.route('/logout')
