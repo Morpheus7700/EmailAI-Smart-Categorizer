@@ -196,6 +196,17 @@ def admin_panel():
     users = [u.to_dict() for u in db.collection('users').stream()]
     return render_template('admin.html', users=users)
 
+@app.route('/api/status')
+def api_status():
+    """Diagnostic route to check API and Model status."""
+    status = {
+        "gemini_api_key_set": bool(GEMINI_API_KEY),
+        "model_initialized": 'model' in globals(),
+        "is_production": bool(is_production),
+        "admin_email": ADMIN_EMAIL
+    }
+    return jsonify(status)
+
 @app.route('/api/emails')
 def get_emails():
     user_id = session.get('user_id')
@@ -274,50 +285,50 @@ def get_emails():
 
 def ai_categorize_batch(emails):
     if not GEMINI_API_KEY: 
-        app.logger.error("GEMINI_API_KEY is missing from environment")
+        app.logger.error("DIAGNOSTIC: GEMINI_API_KEY is missing from environment variables.")
         return None
     
-    # Strictly defined categories
-    prompt_header = """SYSTEM INSTRUCTION: You are a strict email filter. YOU MUST NOT USE 'Primary' for any email that fits another category. Be aggressive in sorting into Social, Promotions, Updates, Finance & Bills, or Travel.
+    # Strictly defined categories with strong semantic hints
+    prompt_header = """SYSTEM INSTRUCTION:
+You are an advanced email classifier. You MUST categorize each email into EXACTLY ONE of the following:
+- Social: From Social Networks (LinkedIn, FB, IG), dating apps, or forums.
+- Promotions: Marketing, newsletters, sales, offers, brand announcements.
+- Updates: Automated system alerts, shipping, order confirmations, security alerts, login notifications.
+- Finance & Bills: Bank statements, invoices, bill reminders, payment receipts.
+- Travel: Flights, hotels, itineraries, car rentals.
+- Primary: ONLY for 1-to-1 personal conversations between humans.
 
-Categories:
-- Social: LinkedIn, Facebook, Twitter, social networks, community updates.
-- Promotions: Discounts, sales, newsletters, brand marketing.
-- Updates: Shipping, order confirmations, login alerts, system notifications.
-- Finance & Bills: Bank alerts, receipts, invoices, statements.
-- Travel: Flights, hotels, bookings.
-- Primary: ONLY for personal 1-to-1 emails from actual people.
+CRITICAL RULE: NEVER default to 'Primary' if there is ANY signal for another category. Be aggressive.
+Output: A JSON list of strings only. No explanation."""
 
-Return ONLY a JSON list of strings (e.g., ["Promotions", "Social"])."""
+    # Structured data provides much stronger signals than a single string
+    structured_data = []
+    for e in emails:
+        structured_data.append({
+            "from": e.get('from'),
+            "subject": e.get('subject'),
+            "list_id": e.get('list_id'),
+            "snippet": e.get('snippet', '')[:120]
+        })
 
-    email_data = [f"From: {e['from']} | Sub: {e['subject']} | Snippet: {e['snippet'][:100]}" for e in emails]
-    full_prompt = f"{prompt_header}\n\nEmails to categorize:\n{json.dumps(email_data)}"
-    
     try:
-        app.logger.info(f"Sending {len(emails)} emails to Gemini...")
+        app.logger.info(f"FORENSIC: Sending {len(emails)} emails to Gemini with structured data.")
+        # We use a very direct prompt to ensure the model focuses on the schema
         response = model.generate_content(
-            full_prompt,
+            f"{prompt_header}\n\nDATA TO CATEGORIZE:\n{json.dumps(structured_data)}",
             generation_config={"response_mime_type": "application/json"}
         )
         
         response_text = response.text.strip()
-        app.logger.info(f"Gemini Response: {response_text}")
+        app.logger.info(f"FORENSIC: Gemini Raw Response: {response_text}")
         
-        # Robust parsing
-        try:
-            # Try to find the JSON array if there's extra text
-            start = response_text.find('[')
-            end = response_text.rfind(']') + 1
-            if start != -1 and end != -1:
-                categories = json.loads(response_text[start:end])
-                if isinstance(categories, list):
-                    return categories
-        except Exception as parse_err:
-            app.logger.error(f"JSON Parse Error: {str(parse_err)}")
+        categories = json.loads(response_text)
+        if isinstance(categories, list):
+            return categories
             
         return None
     except Exception as e:
-        app.logger.error(f"Gemini API Error: {str(e)}")
+        app.logger.error(f"FORENSIC: Gemini API/Parse Error: {str(e)}")
         return None
 
 @app.route('/logout')
